@@ -136,4 +136,33 @@ describe("chunkHtsRows — hierarchy-preserving HTS chunking (KTD3)", () => {
     ];
     expect(() => chunkHtsRows(corrupt)).toThrow(/indent/);
   });
+
+  it("fails loudly on a negative indent", () => {
+    const negative: HtsRow[] = [
+      { htsno: "6109.10.00.12", indent: "-1", superior: null, units: ["doz."], general: "16.5%", description: "Men's" },
+    ];
+    expect(() => chunkHtsRows(negative)).toThrow(/indent/);
+  });
+
+  it("falls back to the heading when a leaf code has fewer than 6 digits", () => {
+    // Defensive: a short/terminal code shouldn't crash the subheading derivation.
+    const short: HtsRow[] = [
+      { htsno: "9999", indent: "0", superior: null, units: [], general: "Free", description: "Terminal heading with no subdivision" },
+    ];
+    const [chunk] = chunkHtsRows(short);
+    expect(chunk.metadata.chapter).toBe("99");
+    expect(chunk.metadata.heading).toBe("9999");
+    expect(chunk.metadata.subheading).toBe("9999");
+  });
+
+  it("yields an empty general_duty when neither the leaf nor any ancestor carries a rate", () => {
+    // Real shape for chapter 98/99 special provisions where the duty is a
+    // cross-reference, not a column-1 rate.
+    const noRate: HtsRow[] = [
+      { htsno: "9903", indent: "0", superior: null, units: [], general: "", description: "Special provisions" },
+      { htsno: "9903.88.03", indent: "1", superior: null, units: [], general: "", description: "Articles the product of China" },
+    ];
+    const leaf = chunkHtsRows(noRate).find((c) => c.metadata.hts_code === "9903.88.03");
+    expect(leaf!.metadata.general_duty).toBe("");
+  });
 });
