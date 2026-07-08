@@ -20,18 +20,29 @@ npm run dev                  # http://localhost:3000
 
 The home page reports LLM-gateway health via `GET /api/health`.
 
-## Provision + deploy (Insforge)
+## Deployment
 
-1. Create a project at [insforge.dev](https://insforge.dev) → copy the Project ID.
-2. Link this repo: `npx @insforge/cli link --project-id <your-project-id>`
-3. Set the deployment env vars (see `.env.example`) in the Insforge console.
-4. Deploy: `npm run deploy` (`insforge deployments deploy .`).
+**Live:** https://bp6d8gmu.insforge.site — health check at `/api/health`.
 
-Insforge Sites runs a Vercel production build under the hood, so the public URL
-satisfies the "deployed to a public endpoint" requirement (R11).
+Deployed via Insforge Sites (`npm run deploy` → `npx @insforge/cli deployments
+deploy .`), which runs a Vercel production build under the hood, satisfying the
+"deployed to a public endpoint" requirement (R11).
+
+Deployment env vars are stored in Insforge (not committed) and applied on every
+build:
+
+```bash
+npx @insforge/cli deployments env list          # inspect
+npx @insforge/cli deployments env set KEY VALUE  # add/update, then re-deploy
+npm run deploy                                    # redeploy from source
+```
+
+To reconnect a fresh checkout: `npx @insforge/cli login` then
+`npx @insforge/cli link --project-id <id>`, and `npx @insforge/cli ai setup` to
+re-provision `OPENROUTER_API_KEY` into `.env.local`.
 
 ## Status
 
-Unit U1 (scaffold + provisioning + deploy skeleton) — walking skeleton only.
+Unit U1 (scaffold + provisioning + deploy skeleton) — **complete and live**.
 Corpus ingestion, retrieval, the agent loop, memory, chat UI, and the eval
 harness land in U2–U11.
