@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+
+# secrets — only .env.example is committed (KTD11)
+.env
+.env*.local
+
+# insforge cli link / credentials
+.insforge/
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
