@@ -30,6 +30,23 @@ export interface RateLimiterOptions {
   now?: () => number;
 }
 
+/**
+ * Derive a per-session rate-limit key from an access-token cookie, or null when
+ * absent (caller falls back to an IP key). Keys on the JWT SIGNATURE segment: a
+ * JWT is `header.payload.signature`, and its leading chars are the base64url
+ * header (`{"alg":"HS256",...}`) — IDENTICAL across all users on one algorithm —
+ * so a head slice would collapse every authenticated broker into a single bucket
+ * (one broker's flood would 429 everyone). The signature is the entropy-bearing,
+ * per-session part. Exported so this regression stays covered without a live edge
+ * request. A non-JWT token falls back to the whole string.
+ */
+export function sessionKeyFromToken(token: string | undefined | null): string | null {
+  if (!token) return null;
+  const parts = token.split(".");
+  const signature = parts.length === 3 ? parts[2] : token;
+  return `session:${signature.slice(0, 24)}`;
+}
+
 /** Soft cap after which expired windows are swept, bounding memory under churn. */
 const PRUNE_THRESHOLD = 10_000;
 
@@ -59,6 +76,11 @@ export function createRateLimiter({
 
   return function check(key: string): RateLimitResult {
     const at = now();
+    // A non-positive max means "closed" — refuse every request. Guard here so the
+    // fresh-window branch below can't leak one request per key when max <= 0.
+    if (max <= 0) {
+      return { allowed: false, remaining: 0, resetAt: at + windowMs };
+    }
     prune(at);
 
     const window = windows.get(key);

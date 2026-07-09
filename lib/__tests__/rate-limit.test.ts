@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createRateLimiter } from "@/lib/rate-limit";
+import { createRateLimiter, sessionKeyFromToken } from "@/lib/rate-limit";
 
 /**
  * The limiter is the app-layer guard on the billable `/api/chat` path. Its window
@@ -43,5 +43,37 @@ describe("createRateLimiter", () => {
     const afterReset = check("k");
     expect(afterReset.allowed).toBe(true);
     expect(afterReset.remaining).toBe(0);
+  });
+
+  it("refuses every request when max <= 0 (fully-closed config)", () => {
+    let now = 0;
+    const check = createRateLimiter({ max: 0, windowMs: 1_000, now: () => now });
+    // Regression: the fresh-window branch used to leak one request per key.
+    expect(check("k").allowed).toBe(false);
+    expect(check("k").allowed).toBe(false);
+  });
+});
+
+describe("sessionKeyFromToken", () => {
+  // Two HS256 JWTs for different users share the header segment but differ in
+  // payload + signature. Keying must NOT collapse them into one bucket.
+  const HEADER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+  const tokenA = `${HEADER}.eyJzdWIiOiJhbGljZSJ9.SIGNATURE_ALICE_abcdefghijklmnop`;
+  const tokenB = `${HEADER}.eyJzdWIiOiJib2JfXyJ9.SIGNATURE_BOB_zyxwvutsrqponml`;
+
+  it("returns null with no token (caller falls back to IP)", () => {
+    expect(sessionKeyFromToken(undefined)).toBeNull();
+    expect(sessionKeyFromToken("")).toBeNull();
+  });
+
+  it("distinguishes two users whose JWTs share the header segment", () => {
+    const keyA = sessionKeyFromToken(tokenA);
+    const keyB = sessionKeyFromToken(tokenB);
+    expect(keyA).not.toBeNull();
+    expect(keyA).not.toEqual(keyB); // the head-slice bug made these equal
+  });
+
+  it("falls back to the whole string for a non-JWT token", () => {
+    expect(sessionKeyFromToken("opaque-token-value")).toBe("session:opaque-token-value");
   });
 });

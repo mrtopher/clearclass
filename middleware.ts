@@ -20,7 +20,7 @@ import {
   type CookieStore,
 } from "@insforge/sdk/ssr/middleware";
 
-import { createRateLimiter } from "@/lib/rate-limit";
+import { createRateLimiter, sessionKeyFromToken } from "@/lib/rate-limit";
 
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX ?? 30);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000);
@@ -32,12 +32,19 @@ const checkRateLimit = createRateLimiter({
 
 /**
  * Rate-limit key: the session (access-token cookie) when authenticated, else the
- * client IP. A token prefix is enough to distinguish sessions without logging the
- * whole credential.
+ * client IP. Key on the JWT SIGNATURE segment, not a head slice — a JWT is
+ * `header.payload.signature`, and the first chars are the base64url header
+ * (`{"alg":"HS256",...}`), IDENTICAL for every user, so slicing the head would
+ * collapse all authenticated brokers into one bucket. The signature is the
+ * entropy-bearing, per-session part. IP fallback uses the platform-forwarded
+ * client address (spoofable at the edge — this is defense in depth; the spend cap
+ * is the real backstop).
  */
 function clientKey(request: NextRequest): string {
-  const token = request.cookies.get("insforge_access_token")?.value;
-  if (token) return `session:${token.slice(0, 24)}`;
+  const sessionKey = sessionKeyFromToken(
+    request.cookies.get("insforge_access_token")?.value,
+  );
+  if (sessionKey) return sessionKey;
   const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
   const ip = forwarded || request.headers.get("x-real-ip") || "unknown";
   return `ip:${ip}`;
@@ -49,13 +56,23 @@ function clientKey(request: NextRequest): string {
  * `set` overload, so this is the SDK's documented middleware usage with the
  * overload variance bridged at the one call boundary.
  */
-function refreshSession(request: NextRequest, response: NextResponse) {
-  return updateSession({
-    requestCookies: request.cookies as unknown as CookieStore,
-    responseCookies: response.cookies as unknown as CookieStore,
-    baseUrl: process.env.NEXT_PUBLIC_INSFORGE_BASE_URL ?? "",
-    anonKey: process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY,
-  });
+async function refreshSession(request: NextRequest, response: NextResponse) {
+  try {
+    await updateSession({
+      requestCookies: request.cookies as unknown as CookieStore,
+      responseCookies: response.cookies as unknown as CookieStore,
+      baseUrl: process.env.NEXT_PUBLIC_INSFORGE_BASE_URL ?? "",
+      anonKey: process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY,
+    });
+  } catch (err) {
+    // A refresh failure (e.g. Insforge unreachable) must NOT 500 every request —
+    // session refresh is best-effort. The route's own auth gate (lib/chat-gate)
+    // is the real boundary: a stale/expired token simply fails getCurrentUser()
+    // there and is rejected cleanly, rather than taking down the whole app.
+    console.warn(
+      `[middleware] session refresh skipped: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 export async function middleware(request: NextRequest) {

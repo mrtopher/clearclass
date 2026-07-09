@@ -88,9 +88,16 @@ type ServerClient = Awaited<ReturnType<typeof serverClient>>;
 
 /** The verified principal, or null when the request carries no valid session. */
 async function principalFrom(client: ServerClient): Promise<Principal | null> {
-  const { data, error } = await client.auth.getCurrentUser();
-  if (error || !data?.user) return null;
-  return { userId: data.user.id, email: data.user.email ?? undefined };
+  try {
+    const { data, error } = await client.auth.getCurrentUser();
+    if (error || !data?.user) return null;
+    return { userId: data.user.id, email: data.user.email ?? undefined };
+  } catch {
+    // A thrown verification (e.g. gateway/network failure) must fail CLOSED — an
+    // unresolved principal is treated as unauthenticated (→ 401 at the gate),
+    // never as an authenticated pass. Better a clean rejection than a 500.
+    return null;
+  }
 }
 
 /**
