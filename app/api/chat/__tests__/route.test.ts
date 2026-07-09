@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { describe, expect, it, vi } from "vitest";
 
-import { handleChat, type ChatDeps } from "@/app/api/chat/route";
+import { handleChat, type ChatDeps } from "@/lib/chat-gate";
 import {
   resolveEffectiveImporter,
   type ResolveTenantResult,
