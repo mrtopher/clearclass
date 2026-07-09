@@ -19,7 +19,8 @@ next-env.d.ts
 # insforge cli link / credentials
 .insforge/
 
-# generated corpus artifacts (regenerable via npm run ingest:hts)
+# generated corpus + eval artifacts (regenerable via `npm run ingest` —
+# ingest:hts, ingest:gri, ingest:rulings; the latter also caches the eval split)
 /data/
 
 # misc

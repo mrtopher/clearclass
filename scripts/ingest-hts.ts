@@ -20,11 +20,11 @@
  * atomically (temp + rename) so an interrupted run cannot leave a truncated or
  * clobbered corpus on disk.
  */
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { chunkHtsRows, type HtsChunk, type HtsRow } from "@/lib/chunking";
+import { writeJsonlAtomic } from "@/lib/corpus-io";
 
 const EXPORT_BASE = "https://hts.usitc.gov/reststop/exportList";
 const FIRST_CHAPTER = 1;
@@ -220,13 +220,9 @@ async function main(): Promise<void> {
     );
   }
 
-  // Atomic write: stage to a temp sibling then rename into place, so an
-  // interrupted write can never truncate or clobber an existing good corpus.
-  await mkdir(dirname(outPath), { recursive: true });
-  const tmpPath = `${outPath}.tmp`;
-  const jsonl = allChunks.map((c) => JSON.stringify(c)).join("\n") + "\n";
-  await writeFile(tmpPath, jsonl, "utf8");
-  await rename(tmpPath, outPath);
+  // Atomic write (temp + rename) so an interrupted write can never truncate or
+  // clobber an existing good corpus. Shared with the other ingest scripts.
+  await writeJsonlAtomic(outPath, allChunks);
 
   console.log(
     `\n[ingest-hts] Wrote ${allChunks.length} chunks` +
