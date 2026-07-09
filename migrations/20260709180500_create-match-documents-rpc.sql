@@ -39,6 +39,14 @@ AS $$
     d.metadata,
     1 - (d.embedding <=> query_embedding) AS similarity
   FROM public.documents d
+  -- CAVEAT (filter_type): HNSW is an approximate index — it returns a bounded
+  -- candidate pool (hnsw.ef_search) that this WHERE then filters. For a narrow
+  -- type (e.g. 'gri', a tiny slice of the corpus) the nearest-neighbour pool may
+  -- contain few/zero rows of that type, so a filtered call can return FEWER than
+  -- match_count even when enough matching rows exist. The U5 recall harness does
+  -- NOT filter by type (it searches all sources), so its baseline is unaffected;
+  -- the agent's optional `type` argument and U9's advanced retrieval should raise
+  -- ef_search or pre-filter per type if they need full match_count under a filter.
   WHERE filter_type IS NULL OR d.type = filter_type
   ORDER BY d.embedding <=> query_embedding
   -- Guard against a non-positive match_count producing a LIMIT 0 / error; the
@@ -46,6 +54,13 @@ AS $$
   LIMIT GREATEST(match_count, 1);
 $$;
 
--- The only runtime caller is an authenticated request (U6, post-U11); the
--- offline recall harness authenticates with the admin key which bypasses grants.
+-- Authorization model: the ONLY roles that may execute this are `authenticated`
+-- (U6 runtime, post-U11) and the admin key (offline recall harness, bypasses
+-- grants). Postgres grants EXECUTE to PUBLIC by default on CREATE FUNCTION, and
+-- PUBLIC includes PostgREST's `anon` role — so we must REVOKE that default first,
+-- otherwise the GRANT below is redundant and `anon` could still reach the RPC.
+-- (An anon call would then error on the documents SELECT policy rather than leak
+-- rows, but relying on that downstream table grant is fragile; revoke here so the
+-- function boundary is the authorization, matching the migration's stated intent.)
+REVOKE EXECUTE ON FUNCTION public.match_documents(vector, integer, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.match_documents(vector, integer, text) TO authenticated;

@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   clampK,
+  createFetchSearch,
   denseRetrieve,
   toRetrievedChunk,
   DEFAULT_K,
@@ -98,5 +99,55 @@ describe("toRetrievedChunk", () => {
     ["missing similarity", { id: 1, content: "x", type: "hts", metadata: {} }, /missing a numeric similarity/],
   ])("fails loudly on %s", (_label, value, pattern) => {
     expect(() => toRetrievedChunk(value, "rpc row 3")).toThrow(pattern as RegExp);
+  });
+});
+
+describe("createFetchSearch", () => {
+  const cfg = { baseUrl: "https://db.example", apiKey: "admin-key" };
+  const okBody = [
+    { id: 1, content: "Live horses", type: "hts", metadata: { hts_code: "0101.21.00.10" }, similarity: 0.9 },
+  ];
+  const fakeResponse = (init: { ok: boolean; status?: number; json?: unknown; text?: string }) => ({
+    ok: init.ok,
+    status: init.status ?? (init.ok ? 200 : 500),
+    json: async () => init.json,
+    text: async () => init.text ?? "",
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("posts the query to the match_documents RPC and maps the rows", async () => {
+    const fetchMock = vi.fn((_url: string, _init: RequestInit) =>
+      Promise.resolve(fakeResponse({ ok: true, json: okBody })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const out = await createFetchSearch(cfg)([0.1, 0.2], { k: 3, type: "hts" });
+
+    expect(out).toHaveLength(1);
+    expect(out[0].metadata.hts_code).toBe("0101.21.00.10");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://db.example/api/database/rpc/match_documents");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer admin-key");
+    expect(JSON.parse(init.body as string)).toEqual({ query_embedding: [0.1, 0.2], match_count: 3, filter_type: "hts" });
+  });
+
+  it("sends filter_type:null when no type is given (search all sources)", async () => {
+    const fetchMock = vi.fn((_url: string, _init: RequestInit) =>
+      Promise.resolve(fakeResponse({ ok: true, json: okBody })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await createFetchSearch(cfg)([0.1], { k: 5 });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).filter_type).toBeNull();
+  });
+
+  it("throws on a non-OK HTTP status (does not swallow a PostgREST error)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => fakeResponse({ ok: false, status: 500, text: "boom" })));
+    await expect(createFetchSearch(cfg)([0.1], { k: 3 })).rejects.toThrow(/match_documents HTTP 500: boom/);
+  });
+
+  it("throws on a non-array body rather than reading an error object as 'no matches'", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => fakeResponse({ ok: true, json: { error: "nope" } })));
+    await expect(createFetchSearch(cfg)([0.1], { k: 3 })).rejects.toThrow(/expected an array of rows/);
   });
 });

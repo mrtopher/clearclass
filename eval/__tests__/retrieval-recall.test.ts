@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   chunkCodes,
@@ -9,10 +9,12 @@ import {
   matchesAtDigits,
   parseArgs,
   rowHitAtK,
+  scoreRows,
   summarizeRecall,
   IMPLAUSIBLY_LOW_RECALL,
   type RecallResult,
   type RowResult,
+  type TestRow,
 } from "@/eval/retrieval-recall";
 import type { RetrievedChunk } from "@/lib/retrieval/dense";
 
@@ -36,7 +38,11 @@ describe("cleanQuery", () => {
     expect(cleanQuery("men's cotton knit t-shirt")).toBe("men's cotton knit t-shirt");
   });
   it("falls back to the original when stripping would empty the query", () => {
-    expect(cleanQuery("What is the HTS code for?")).not.toBe("");
+    // "... of ?" DOES match the prefix (whitespace after 'of'), so the strip
+    // consumes everything and the trailing-? removal leaves "" — exercising the
+    // `stripped || collapsed` fallback for real (not the trivially-non-empty case).
+    const allBoilerplate = "What is the tariff classification of ?";
+    expect(cleanQuery(allBoilerplate)).toBe("What is the tariff classification of ?");
   });
 });
 
@@ -129,6 +135,43 @@ describe("formatRecallTable", () => {
     ));
     expect(table.split("\n")[0]).toBe("digits\tk=5\tk=10");
     expect(table).toContain("6\t1.000\t1.000");
+  });
+});
+
+describe("scoreRows", () => {
+  const rows: TestRow[] = [
+    { description: "cotton shirt", gold_hts: "6109.10.0040" },
+    { description: "steel fitting", gold_hts: "7307.19.9060" },
+    { description: "leather bag", gold_hts: "4202.21.9000" },
+  ];
+  const embeddings = [[0.1], [0.2], [0.3]];
+  const chunkWith = (code: string): RetrievedChunk => ({
+    id: 1, content: "x", type: "hts", metadata: { hts_code: code }, similarity: 0.5,
+  });
+
+  it("skips a failed row, counts it, and still scores the survivors", async () => {
+    const searchOne = vi.fn(async (_emb: number[], i: number) => {
+      if (i === 1) throw new Error("RPC 503");
+      return [chunkWith(rows[i].gold_hts)];
+    });
+    const { scored, errors } = await scoreRows(rows, embeddings, searchOne);
+    expect(errors).toBe(1);
+    expect(scored).toHaveLength(2);
+    expect(scored.map((s) => s.gold)).toEqual(["6109.10.0040", "4202.21.9000"]);
+  });
+
+  it("returns zero scored rows when every search fails (caller aborts)", async () => {
+    const { scored, errors } = await scoreRows(rows, embeddings, async () => {
+      throw new Error("down");
+    });
+    expect(scored).toEqual([]);
+    expect(errors).toBe(3);
+  });
+
+  it("reports progress per row", async () => {
+    const seen: Array<[number, number]> = [];
+    await scoreRows(rows, embeddings, async () => [chunkWith("6109.10.0040")], (d, t) => seen.push([d, t]));
+    expect(seen).toEqual([[1, 3], [2, 3], [3, 3]]);
   });
 });
 

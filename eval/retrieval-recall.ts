@@ -182,7 +182,51 @@ export function formatRecallTable(results: readonly RecallResult[]): string {
   return lines.join("\n");
 }
 
+/** Run per-query search with an injected `searchOne`, returning scored rows and an error count. */
+export interface ScoreOutcome {
+  scored: RowResult[];
+  errors: number;
+}
+
+/**
+ * Score each row by running its pre-computed embedding through `searchOne`
+ * (which encapsulates k and any retry). A per-row failure is caught, counted,
+ * and skipped — one flaky request must not sink the whole baseline — while the
+ * survivors are still scored. The caller decides what a tolerable error rate is
+ * (see `MAX_ERROR_RATE` in `main`); this helper only reports the split so that
+ * policy is testable without a network. `embeddings` is assumed 1:1 with `rows`
+ * (guaranteed by `embedTexts`).
+ */
+export async function scoreRows(
+  rows: readonly TestRow[],
+  embeddings: readonly number[][],
+  searchOne: (embedding: number[], index: number) => Promise<RetrievedChunk[]>,
+  onProgress?: (done: number, total: number) => void,
+): Promise<ScoreOutcome> {
+  const scored: RowResult[] = [];
+  let errors = 0;
+  for (let i = 0; i < rows.length; i++) {
+    try {
+      const chunks = await searchOne(embeddings[i], i);
+      scored.push({ gold: rows[i].gold_hts, rankedCodes: chunks.map(chunkCodes) });
+    } catch (err) {
+      errors++;
+      console.warn(`[eval:recall] row ${i + 1} search failed: ${(err as Error).message} — skipping.`);
+    }
+    onProgress?.(i + 1, rows.length);
+  }
+  return { scored, errors };
+}
+
 // ── CLI / IO shell ────────────────────────────────────────────────────────────
+
+/**
+ * Max fraction of rows allowed to fail before the gate refuses a verdict. A gate
+ * that computed recall over whatever subset happened to succeed could print
+ * "chunking looks sound" from a heavily-degraded run — so past this rate we abort
+ * rather than report a baseline biased toward the lucky survivors.
+ */
+export const MAX_ERROR_RATE = 0.1;
 
 export interface RecallArgs {
   split: string;
@@ -232,12 +276,14 @@ export function parseArgs(argv: string[]): RecallArgs {
 async function loadTestRows(split: string, limit: number | null): Promise<TestRow[]> {
   const absPath = resolve(process.cwd(), split);
   const raw = await readJsonl<Partial<TestRow>>(absPath);
+  // `i` is the record ordinal from readJsonl (which skips blank lines), NOT a
+  // file line number — label it as a row index so it doesn't misdirect debugging.
   const rows: TestRow[] = raw.map((r, i) => {
     if (!r || typeof r.description !== "string" || !r.description.trim()) {
-      throw new Error(`[eval:recall] ${split}:${i + 1} is missing a description`);
+      throw new Error(`[eval:recall] ${split} row ${i + 1} is missing a description`);
     }
     if (typeof r.gold_hts !== "string" || !r.gold_hts.trim()) {
-      throw new Error(`[eval:recall] ${split}:${i + 1} is missing a gold_hts code`);
+      throw new Error(`[eval:recall] ${split} row ${i + 1} is missing a gold_hts code`);
     }
     return { description: r.description.trim(), gold_hts: r.gold_hts.trim() };
   });
@@ -266,28 +312,27 @@ async function main(): Promise<void> {
     `embed ${rows.length} queries`,
   );
 
-  const scored: RowResult[] = [];
-  let errors = 0;
-  for (let i = 0; i < rows.length; i++) {
-    try {
-      const chunks = await withRetry(
-        () => search(embeddings[i], { k: maxK }),
-        `match row ${i + 1}`,
-      );
-      scored.push({ gold: rows[i].gold_hts, rankedCodes: chunks.map(chunkCodes) });
-    } catch (err) {
-      // A per-row search failure is recorded and skipped (not fatal to the run),
-      // so one flaky request can't sink the whole baseline signal.
-      errors++;
-      console.warn(`[eval:recall] row ${i + 1} search failed: ${(err as Error).message} — skipping.`);
-    }
-    if ((i + 1) % 25 === 0 || i + 1 === rows.length) {
-      console.log(`[eval:recall]   ${i + 1}/${rows.length} rows searched`);
-    }
-  }
+  const { scored, errors } = await scoreRows(
+    rows,
+    embeddings,
+    (embedding, i) => withRetry(() => search(embedding, { k: maxK }), `match row ${i + 1}`),
+    (done, total) => {
+      if (done % 25 === 0 || done === total) console.log(`[eval:recall]   ${done}/${total} rows searched`);
+    },
+  );
 
   if (scored.length === 0) {
     throw new Error("[eval:recall] every row failed to search — cannot report recall.");
+  }
+  // Defend the exit-code contract: a run that lost more than MAX_ERROR_RATE of its
+  // rows would compute recall over a biased surviving subset and could falsely
+  // print "chunking looks sound". Refuse the verdict instead.
+  if (errors / rows.length > MAX_ERROR_RATE) {
+    throw new Error(
+      `[eval:recall] ${errors}/${rows.length} rows failed to search ` +
+        `(> ${Math.round(MAX_ERROR_RATE * 100)}%) — the baseline would be biased toward the ` +
+        `surviving rows; aborting rather than reporting a misleading gate.`,
+    );
   }
 
   const results = summarizeRecall(scored, ks, digits);

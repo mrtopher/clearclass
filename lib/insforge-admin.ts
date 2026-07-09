@@ -64,8 +64,10 @@ export function authHeaders(cfg: AdminConfig): Record<string, string> {
 /**
  * Per-request timeout — Node's global fetch has none, so a hung socket would
  * otherwise stall a whole load/retrieval run (and defeat `withRetry`) forever.
+ * Module-private (matches `corpus-io`'s `FETCH_TIMEOUT_MS`) — only `adminFetch`
+ * consumes it; callers use `adminFetch`, not the raw constant.
  */
-export const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export function adminFetch(url: string, init: RequestInit): Promise<Response> {
   return fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });

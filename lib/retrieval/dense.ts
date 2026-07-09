@@ -163,6 +163,15 @@ export type DenseRetriever = (
  * overridable for tests / alternate transports. Admin-config resolution is
  * deferred to the first search so importing this module (e.g. to reuse the pure
  * helpers, or to construct the agent tool) never requires credentials.
+ *
+ * NOTE on the default transport: `resolveAdminConfig()` uses the admin key, which
+ * BYPASSES RLS. That is correct here because `documents` is shared reference data
+ * every broker reads identically (there is no per-importer corpus row), and it is
+ * what the offline recall harness needs. It is NOT a per-user-scoped transport:
+ * if this retriever is ever pointed at an owner-scoped table, the caller MUST
+ * inject a `search` built from the request's JWT (U11) instead of relying on this
+ * admin default — otherwise RLS would silently not apply. Per-importer isolation
+ * lives on `classifications` (U7), never on the corpus.
  */
 export function createDenseRetriever(deps?: Partial<DenseRetrieveDeps>): DenseRetriever {
   const embed: EmbedQuery = deps?.embed ?? (async (text) => (await embedTexts([text]))[0]);
