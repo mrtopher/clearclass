@@ -37,8 +37,17 @@ export interface RateLimiterOptions {
  * header (`{"alg":"HS256",...}`) — IDENTICAL across all users on one algorithm —
  * so a head slice would collapse every authenticated broker into a single bucket
  * (one broker's flood would 429 everyone). The signature is the entropy-bearing,
- * per-session part. Exported so this regression stays covered without a live edge
+ * PER-SESSION part. Exported so this regression stays covered without a live edge
  * request. A non-JWT token falls back to the whole string.
+ *
+ * Deliberately NOT keyed on the `sub` (user id) claim, even though `sub` would be
+ * stable across token refresh (the signature rotates when `updateSession` mints a
+ * new token, resetting the window — but refresh fires near expiry, not per
+ * request, so within a 60s window the key is stable). `sub` is not secret, so a
+ * forged-`sub` cookie could poison a *victim's* bucket (middleware counts the
+ * request before the route's verified gate rejects it) — a targeted DoS the
+ * unforgeable signature resists. Cost is ultimately bounded by the provider spend
+ * cap (KTD11), which this limiter only backs up.
  */
 export function sessionKeyFromToken(token: string | undefined | null): string | null {
   if (!token) return null;
