@@ -26,6 +26,14 @@ describe("interpretAnonRead", () => {
     ).toBe("not-applied");
   });
 
+  it("does NOT treat a missing-column error as not-applied (probe bug, not a migration gap)", () => {
+    // A composite-PK table (e.g. importer_members) has no `id`; a stray column
+    // reference must not masquerade as an unapplied migration.
+    expect(interpretAnonRead(400, 'column "id" does not exist').kind).not.toBe(
+      "not-applied",
+    );
+  });
+
   it("marks a 2xx empty array as weak (RLS filtered, grant not revoked)", () => {
     expect(interpretAnonRead(200, "[]").kind).toBe("weak");
   });

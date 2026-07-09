@@ -39,12 +39,13 @@ export type IsolationVerdict =
 export function interpretAnonRead(status: number, bodyText: string): IsolationVerdict {
   const body = bodyText.toLowerCase();
 
-  // A missing relation means the migration has not been applied — not a pass.
+  // A missing RELATION means the migration has not been applied — not a pass.
+  // Match relation-level absence only: a bare "does not exist" also fires on a
+  // missing COLUMN (42703), which is a probe error, not a migration gap.
   if (
     status === 404 ||
-    body.includes("does not exist") ||
     body.includes("could not find the table") ||
-    (body.includes("relation") && body.includes("not exist"))
+    (body.includes("relation") && body.includes("does not exist"))
   ) {
     return {
       kind: "not-applied",
@@ -99,7 +100,11 @@ function resolveAnonConfig(): AnonConfig {
 }
 
 async function anonRead(cfg: AnonConfig, table: string): Promise<IsolationVerdict> {
-  const url = `${cfg.baseUrl}/api/database/records/${table}?select=id&limit=1`;
+  // No `select=<col>` — the tables differ in shape (importer_members has a
+  // composite PK and no `id` column), and referencing a missing column yields a
+  // 400 that masquerades as a real error. A bare `limit=1` asks for whole rows,
+  // which the anon REVOKE denies at the table level regardless of columns.
+  const url = `${cfg.baseUrl}/api/database/records/${table}?limit=1`;
   try {
     const res = await fetch(url, {
       headers: {
