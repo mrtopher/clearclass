@@ -16,6 +16,7 @@
     "ingest": "npm run ingest:hts && npm run ingest:gri && npm run ingest:rulings",
     "migrate": "npx @insforge/cli db migrations up --all",
     "embed:load": "tsx --env-file-if-exists=.env.local scripts/embed-load.ts",
+    "eval:recall": "tsx --env-file-if-exists=.env.local eval/retrieval-recall.ts",
     "deploy": "npx @insforge/cli deployments deploy ."
   },
   "dependencies": {
@@ -24,7 +25,8 @@
     "ai": "^5.0.0",
     "next": "^15.1.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0",
