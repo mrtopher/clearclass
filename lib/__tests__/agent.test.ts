@@ -6,6 +6,7 @@ import {
   collectWebUrls,
   createRunAgent,
   deriveSourcesUsed,
+  latestUserText,
   normalizeMessages,
   runClassification,
   validateCandidateCitations,
@@ -16,6 +17,7 @@ import {
   type RetrievedIndex,
   type StepLike,
 } from "@/lib/agent";
+import type { MemoryDeps } from "@/lib/memory";
 import type { Candidate, Citation, Classification } from "@/lib/schema";
 import type { TenantContext } from "@/lib/auth";
 
@@ -123,6 +125,9 @@ describe("buildSystemPrompt", () => {
     const withPrecedent = buildSystemPrompt({ precedent: "0101.21 — live horses" });
     expect(withPrecedent).toContain("Prior classifications");
     expect(withPrecedent).toContain("live horses");
+    // Precedent is delimited and framed as untrusted stored data, like web content.
+    expect(withPrecedent).toContain("<precedent>");
+    expect(withPrecedent).toContain("NOT instructions");
   });
 });
 
@@ -247,6 +252,43 @@ describe("normalizeMessages", () => {
   });
 });
 
+describe("latestUserText", () => {
+  it("reads a plain-string user turn", () => {
+    expect(latestUserText([{ role: "user", content: "cotton t-shirt" }])).toBe(
+      "cotton t-shirt",
+    );
+  });
+
+  it("joins the text parts of a useChat-style user turn", () => {
+    expect(
+      latestUserText([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "silk" },
+            { type: "text", text: "scarf" },
+          ],
+        },
+      ] as never),
+    ).toBe("silk scarf");
+  });
+
+  it("returns the LATEST user turn, ignoring assistant turns", () => {
+    expect(
+      latestUserText([
+        { role: "user", content: "first" },
+        { role: "assistant", content: "..." },
+        { role: "user", content: "second" },
+      ]),
+    ).toBe("second");
+  });
+
+  it("returns '' when there is no user text (memory treats it as no-op)", () => {
+    expect(latestUserText([{ role: "assistant", content: "hi" }])).toBe("");
+    expect(latestUserText([])).toBe("");
+  });
+});
+
 // ── orchestration (fake model) ───────────────────────────────────────────────
 
 /** A fake `generate` returning canned output + steps, capturing its args. */
@@ -356,6 +398,15 @@ const TENANT: TenantContext = {
   memberships: ["imp-1"],
 };
 
+/** Hermetic memory deps: no gateway, no DB. Fakes are overridden per test. */
+function fakeMemory(overrides: Partial<MemoryDeps> = {}): Partial<MemoryDeps> {
+  return {
+    embed: overrides.embed ?? (async () => [0.1, 0.2, 0.3]),
+    search: overrides.search ?? (async () => []),
+    insert: overrides.insert ?? (async () => {}),
+  };
+}
+
 describe("createRunAgent", () => {
   const validOutput = classification([
     candidate([corpusCitation(1)]),
@@ -368,6 +419,7 @@ describe("createRunAgent", () => {
     const runAgent = createRunAgent({
       tools: {},
       generate: fakeGenerate(validOutput, validSteps),
+      memory: fakeMemory(),
     });
 
     const res = await runAgent({ messages: "cotton t-shirt", tenant: TENANT });
@@ -382,6 +434,7 @@ describe("createRunAgent", () => {
     const runAgent = createRunAgent({
       tools: {},
       generate: fakeGenerate(validOutput, validSteps),
+      memory: fakeMemory(),
     });
 
     const res = await runAgent({ messages: "   ", tenant: TENANT });
@@ -394,7 +447,7 @@ describe("createRunAgent", () => {
     const generate = vi.fn(async () => {
       throw new Error("gateway exploded: sensitive-internal-detail");
     });
-    const runAgent = createRunAgent({ tools: {}, generate });
+    const runAgent = createRunAgent({ tools: {}, generate, memory: fakeMemory() });
 
     const res = await runAgent({ messages: "x", tenant: TENANT });
 
@@ -402,5 +455,141 @@ describe("createRunAgent", () => {
     const body = await res.json();
     expect(body).toEqual({ error: "classification_failed", degraded: true });
     expect(JSON.stringify(body)).not.toContain("sensitive-internal-detail");
+  });
+});
+
+// ── createRunAgent + U7 per-importer memory ──────────────────────────────────
+
+describe("createRunAgent memory (U7)", () => {
+  const validOutput = classification([
+    candidate([corpusCitation(1)]),
+    candidate([corpusCitation(1)]),
+    candidate([corpusCitation(1)]),
+  ]);
+  const validSteps = [retrieveStep([1])];
+
+  /** A precedent match row as `match_classifications` (via the search dep) returns it. */
+  function precedentRow(chosen_hts: string) {
+    return {
+      product_description: "prior cotton shirt",
+      chosen_hts,
+      confidence: 0.8,
+      reasoning: "GRI 1",
+      similarity: 0.95,
+    };
+  }
+
+  it("AE3: injects this importer's similar prior decision as precedent into the system prompt", async () => {
+    const generate = fakeGenerate(validOutput, validSteps);
+    const search = vi.fn(async () => [precedentRow("6109.10.0012")]);
+    const runAgent = createRunAgent({
+      tools: {},
+      generate,
+      memory: fakeMemory({ search }),
+    });
+
+    await runAgent({ messages: "cotton knit t-shirt", tenant: TENANT });
+
+    // The system prompt handed to the model carries the precedent block.
+    const args = (generate as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(args.system).toContain("Prior classifications");
+    expect(args.system).toContain("6109.10.0012");
+  });
+
+  it("scopes the precedent search to the SERVER-DERIVED importer, never client input (KTD10)", async () => {
+    const search = vi.fn(async (_importerId: string) => []);
+    const runAgent = createRunAgent({
+      tools: {},
+      generate: fakeGenerate(validOutput, validSteps),
+      memory: fakeMemory({ search }),
+    });
+
+    await runAgent({ messages: "cotton t-shirt", tenant: TENANT });
+
+    expect(search.mock.calls[0][0]).toBe(TENANT.importerId);
+  });
+
+  it("edge: a new importer with empty history classifies with no precedent block", async () => {
+    const generate = fakeGenerate(validOutput, validSteps);
+    const runAgent = createRunAgent({
+      tools: {},
+      generate,
+      memory: fakeMemory({ search: async () => [] }),
+    });
+
+    const res = await runAgent({ messages: "cotton t-shirt", tenant: TENANT });
+
+    expect(res.status).toBe(200);
+    const args = (generate as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(args.system).not.toContain("Prior classifications");
+  });
+
+  it("persists the recommended decision-of-record after a successful classification", async () => {
+    const insert = vi.fn(async (_record: unknown) => {});
+    const runAgent = createRunAgent({
+      tools: {},
+      generate: fakeGenerate(validOutput, validSteps),
+      memory: fakeMemory({ insert }),
+    });
+
+    await runAgent({ messages: "cotton t-shirt", tenant: TENANT });
+
+    expect(insert).toHaveBeenCalledOnce();
+    expect(insert.mock.calls[0][0]).toMatchObject({
+      importer_id: TENANT.importerId,
+      user_id: TENANT.principal.userId,
+      chosen_hts: validOutput.recommendation.hts_code,
+      product_description: "cotton t-shirt",
+    });
+  });
+
+  it("does NOT persist when the classification fails (nothing to record)", async () => {
+    const insert = vi.fn(async () => {});
+    const generate = vi.fn(async () => {
+      throw new Error("gateway down");
+    });
+    const runAgent = createRunAgent({ tools: {}, generate, memory: fakeMemory({ insert }) });
+
+    const res = await runAgent({ messages: "x", tenant: TENANT });
+
+    expect(res.status).toBe(502);
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("best-effort: a precedent-read outage still returns a 200 classification", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const search = vi.fn(async () => {
+      throw new Error("memory backend down");
+    });
+    const runAgent = createRunAgent({
+      tools: {},
+      generate: fakeGenerate(validOutput, validSteps),
+      memory: fakeMemory({ search }),
+    });
+
+    const res = await runAgent({ messages: "cotton t-shirt", tenant: TENANT });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ candidates: expect.any(Array) });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("best-effort: a persist failure does not deny the broker their answer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const insert = vi.fn(async () => {
+      throw new Error("insert rejected");
+    });
+    const runAgent = createRunAgent({
+      tools: {},
+      generate: fakeGenerate(validOutput, validSteps),
+      memory: fakeMemory({ insert }),
+    });
+
+    const res = await runAgent({ messages: "cotton t-shirt", tenant: TENANT });
+
+    expect(res.status).toBe(200);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
