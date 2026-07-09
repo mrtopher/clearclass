@@ -74,8 +74,14 @@ export function resolveEffectiveImporter(
  * `baseUrl`/`anonKey` are passed so this honors the existing env contract
  * (`NEXT_PUBLIC_INSFORGE_BASE_URL`, set in `lib/insforge.ts`) rather than the
  * SSR helper's own `NEXT_PUBLIC_INSFORGE_URL` default.
+ *
+ * Exported so per-importer memory (U7) reads/writes `classifications` through
+ * the SAME authenticated principal this module resolves — the request's JWT is
+ * the bearer, so `classifications` RLS actually applies to those runtime calls
+ * (unlike the admin-key corpus transport in `lib/retrieval/dense.ts`, which
+ * bypasses RLS and must never touch a tenant-scoped table). SERVER-ONLY.
  */
-async function serverClient() {
+export async function getServerClient() {
   const cookieStore = await cookies();
   return createServerClient({
     baseUrl: process.env.NEXT_PUBLIC_INSFORGE_BASE_URL ?? "",
@@ -84,7 +90,7 @@ async function serverClient() {
   });
 }
 
-type ServerClient = Awaited<ReturnType<typeof serverClient>>;
+type ServerClient = Awaited<ReturnType<typeof getServerClient>>;
 
 /** The verified principal, or null when the request carries no valid session. */
 async function principalFrom(client: ServerClient): Promise<Principal | null> {
@@ -117,7 +123,7 @@ async function membershipsFrom(client: ServerClient): Promise<string[]> {
 
 /** Convenience: the verified principal for the current request, or null. */
 export async function getPrincipal(): Promise<Principal | null> {
-  return principalFrom(await serverClient());
+  return principalFrom(await getServerClient());
 }
 
 /**
@@ -133,7 +139,7 @@ export type ResolveTenantResult =
 export async function resolveTenant(
   requestedImporterId?: string | null,
 ): Promise<ResolveTenantResult> {
-  const client = await serverClient();
+  const client = await getServerClient();
 
   const principal = await principalFrom(client);
   if (!principal) {
