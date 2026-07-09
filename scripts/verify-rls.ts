@@ -3,10 +3,13 @@
  *
  * The app-layer gate (`app/api/chat` + `lib/auth`) is proven offline in vitest.
  * This script proves the DEFENSE-IN-DEPTH layer that survives an app bug: hit the
- * PostgREST proxy as the `anon` role (the unauthenticated public key) and confirm
- * the tenant tables — `classifications`, `importers`, `importer_members` — refuse
- * the read. It mirrors the out-of-band operational checks (`embed:load`,
- * `eval:recall`): pure decision logic here is unit-tested, the live run wires I/O.
+ * PostgREST proxy as the unauthenticated principal and confirm the tenant tables —
+ * `classifications`, `importers`, `importer_members` — refuse the read. ClearClass
+ * has no Insforge anon key (it exposes no anon-readable data), so that principal is
+ * simply a request with NO token; if a project ever sets
+ * `NEXT_PUBLIC_INSFORGE_ANON_KEY`, the probe presents it instead. It mirrors the
+ * out-of-band operational checks (`embed:load`, `eval:recall`): pure decision logic
+ * here is unit-tested, the live run wires I/O.
  *
  * Run against the deployed backend AFTER `npm run migrate`:
  *     npm run verify:rls
@@ -84,19 +87,24 @@ export function interpretAnonRead(status: number, bodyText: string): IsolationVe
 
 interface AnonConfig {
   baseUrl: string;
-  anonKey: string;
+  /**
+   * Optional. ClearClass has no Insforge anon key (the SDK's `anonKey` is optional
+   * and the app exposes no anon-readable data — everything is behind a user JWT or
+   * the admin key). When unset we probe with NO token, which is the true
+   * unauthenticated principal for this project.
+   */
+  anonKey?: string;
 }
 
 function resolveAnonConfig(): AnonConfig {
   const baseUrl = process.env.NEXT_PUBLIC_INSFORGE_BASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY;
-  if (!baseUrl || !anonKey) {
+  if (!baseUrl) {
     throw new Error(
-      "[verify-rls] Set NEXT_PUBLIC_INSFORGE_BASE_URL and NEXT_PUBLIC_INSFORGE_ANON_KEY " +
-        "(see .env.example / .env.local) to run the live isolation gate.",
+      "[verify-rls] Set NEXT_PUBLIC_INSFORGE_BASE_URL (see .env.example / .env.local) " +
+        "to run the live isolation gate.",
     );
   }
-  return { baseUrl, anonKey };
+  return { baseUrl, anonKey: process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY || undefined };
 }
 
 async function anonRead(cfg: AnonConfig, table: string): Promise<IsolationVerdict> {
@@ -105,13 +113,17 @@ async function anonRead(cfg: AnonConfig, table: string): Promise<IsolationVerdic
   // 400 that masquerades as a real error. A bare `limit=1` asks for whole rows,
   // which the anon REVOKE denies at the table level regardless of columns.
   const url = `${cfg.baseUrl}/api/database/records/${table}?limit=1`;
+  // Present the public anon key IF this project has one; otherwise send NO
+  // credentials — for ClearClass the unauthenticated principal simply carries no
+  // token, and the gateway refusing it (401) IS the isolation boundary. (With an
+  // anon key you could additionally distinguish a role-level grant refusal from a
+  // gateway rejection; ClearClass has no such anon role, so this is complete.)
+  const headers: Record<string, string> = cfg.anonKey
+    ? { Authorization: `Bearer ${cfg.anonKey}`, apikey: cfg.anonKey }
+    : {};
   try {
     const res = await fetch(url, {
-      headers: {
-        // Present ONLY the public anon key — this is the unauthenticated principal.
-        Authorization: `Bearer ${cfg.anonKey}`,
-        apikey: cfg.anonKey,
-      },
+      headers,
       signal: AbortSignal.timeout(30_000),
     });
     return interpretAnonRead(res.status, await res.text());
@@ -125,7 +137,10 @@ async function anonRead(cfg: AnonConfig, table: string): Promise<IsolationVerdic
 
 async function main(): Promise<void> {
   const cfg = resolveAnonConfig();
-  console.log(`[verify-rls] anon isolation check against ${cfg.baseUrl}\n`);
+  const principal = cfg.anonKey ? "anon key" : "no token (unauthenticated)";
+  console.log(
+    `[verify-rls] isolation check against ${cfg.baseUrl} as ${principal}\n`,
+  );
 
   const results = await Promise.all(
     TENANT_TABLES.map(async (table) => ({ table, verdict: await anonRead(cfg, table) })),
