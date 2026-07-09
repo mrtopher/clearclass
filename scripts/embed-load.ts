@@ -27,11 +27,16 @@
  * The pure core (`batch`/`toRows`/`loadCorpus`) is dependency-injected so this
  * contract is unit-tested without a network or database.
  */
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { readJsonl, withRetry } from "@/lib/corpus-io";
+import {
+  adminFetch,
+  authHeaders,
+  resolveAdminConfig,
+  type AdminConfig,
+} from "@/lib/insforge-admin";
 import { DEFAULT_EMBEDDING_MODEL, embedTexts } from "@/lib/llm";
 
 /** Canonical corpus artifacts produced by U2/U3. */
@@ -222,61 +227,14 @@ export function parseArgs(argv: string[]): Args {
   return { files, batchSize, truncate, limit };
 }
 
-/** Resolve the admin base URL + API key, preferring env, then .insforge/project.json. */
-function resolveAdminConfig(): { baseUrl: string; apiKey: string } {
-  const baseUrl = process.env.NEXT_PUBLIC_INSFORGE_BASE_URL;
-  let apiKey = process.env.INSFORGE_API_KEY;
-
-  if (!apiKey) {
-    // Local-dev convenience: the linked project's admin key lives here. Never
-    // committed (.insforge/ is gitignored); env takes precedence in CI/deploy.
-    try {
-      const linked = JSON.parse(
-        readFileSync(resolve(process.cwd(), ".insforge/project.json"), "utf8"),
-      ) as { api_key?: string };
-      apiKey = linked.api_key;
-    } catch {
-      // fall through to the loud error below
-    }
-  }
-
-  if (!baseUrl || !apiKey) {
-    throw new Error(
-      "[embed-load] Insforge admin config missing. Set NEXT_PUBLIC_INSFORGE_BASE_URL and " +
-        "INSFORGE_API_KEY (server-only), or run `npx @insforge/cli link` so " +
-        ".insforge/project.json is present. See .env.example.",
-    );
-  }
-  return { baseUrl, apiKey };
-}
-
-interface AdminConfig {
-  baseUrl: string;
-  apiKey: string;
-}
-
 /**
- * InsForge exposes a PostgREST proxy at `/api/database/records/<table>`. We talk
- * to it directly with `fetch` rather than through `@insforge/sdk`: the SDK's
- * bundle `require()`s `@insforge/shared-schemas`, which ships only an ESM
- * `export` condition, so it loads under Next's bundler but NOT under a plain
- * tsx/Node offline script. The admin API key authenticates as `Bearer` and
- * bypasses RLS — correct for this out-of-band shared-corpus load.
+ * InsForge exposes a PostgREST proxy at `/api/database/records/<table>`. Admin
+ * config resolution, the `Bearer` auth header, and the timeout-bounded fetch are
+ * shared with the retriever in `@/lib/insforge-admin` (and the reason we bypass
+ * the SDK). This module keeps only the record-endpoint URL shaping.
  */
 function recordsUrl(cfg: AdminConfig, query = ""): string {
   return `${cfg.baseUrl}/api/database/records/${TABLE}${query}`;
-}
-
-function authHeaders(cfg: AdminConfig): Record<string, string> {
-  return { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" };
-}
-
-/** Per-request timeout — Node's global fetch has none, so a hung socket would
- *  otherwise stall the whole ~24k-row load (and defeat `withRetry`) forever. */
-const REQUEST_TIMEOUT_MS = 30_000;
-
-function fetchAdmin(url: string, init: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
 }
 
 /** Row total from a PostgREST `Content-Range` header ("start-end/total", e.g. "0-63/64"). */
@@ -293,7 +251,7 @@ function contentRangeTotal(res: Response): number {
  * 1536-dim vector across the wire (~148 MB over the corpus) just to count them.
  */
 async function insertRows(cfg: AdminConfig, rows: DocumentRow[]): Promise<number> {
-  const res = await fetchAdmin(recordsUrl(cfg), {
+  const res = await adminFetch(recordsUrl(cfg), {
     method: "POST",
     headers: { ...authHeaders(cfg), Prefer: "return=minimal, count=exact" },
     body: JSON.stringify(rows),
@@ -307,7 +265,7 @@ async function insertRows(cfg: AdminConfig, rows: DocumentRow[]): Promise<number
 /** Delete every corpus row so a re-run replaces rather than duplicates. */
 async function truncateTable(cfg: AdminConfig): Promise<void> {
   // PostgREST refuses an unfiltered delete; `id >= 0` matches all BIGSERIAL rows.
-  const res = await fetchAdmin(recordsUrl(cfg, "?id=gte.0"), {
+  const res = await adminFetch(recordsUrl(cfg, "?id=gte.0"), {
     method: "DELETE",
     headers: authHeaders(cfg),
   });
@@ -318,7 +276,7 @@ async function truncateTable(cfg: AdminConfig): Promise<void> {
 
 /** Authoritative row count, independent of what the inserts reported. */
 async function tableCount(cfg: AdminConfig): Promise<number> {
-  const res = await fetchAdmin(recordsUrl(cfg, "?select=id&limit=1"), {
+  const res = await adminFetch(recordsUrl(cfg, "?select=id&limit=1"), {
     method: "GET",
     headers: { ...authHeaders(cfg), Prefer: "count=exact" },
   });
