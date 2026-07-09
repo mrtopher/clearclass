@@ -7,7 +7,7 @@
  * (atomic temp+rename; bounded retry with backoff) consistent and in one place
  * rather than re-derived per script.
  */
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 /**
@@ -26,45 +26,89 @@ export async function writeJsonlAtomic(
   await rename(tmpPath, absPath);
 }
 
-/** Per-request timeout — Node's global fetch has none, so a hung socket would otherwise stall a run forever. */
-const FETCH_TIMEOUT_MS = 30_000;
-const MAX_FETCH_ATTEMPTS = 3;
+/**
+ * Read a JSONL corpus artifact written by `writeJsonlAtomic` back into records.
+ * Blank lines (including the trailing newline) are skipped; a malformed line
+ * throws with its line number rather than yielding a partial/undefined record,
+ * so a truncated or corrupt corpus fails loudly at load time (U4).
+ */
+export async function readJsonl<T>(absPath: string): Promise<T[]> {
+  const raw = await readFile(absPath, "utf8");
+  const records: T[] = [];
+  const lines = raw.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      records.push(JSON.parse(line) as T);
+    } catch (err) {
+      throw new Error(
+        `[corpus-io] ${absPath}:${i + 1} is not valid JSON: ${(err as Error).message}`,
+      );
+    }
+  }
+  return records;
+}
+
+const MAX_ATTEMPTS = 3;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
- * Fetch `url` with a timeout and bounded exponential backoff, then run `parse`
- * on the successful response. A non-OK HTTP status or a `parse` throw is retried
- * up to `MAX_FETCH_ATTEMPTS`; the final failure throws with `label` for context.
+ * Run `op` with bounded exponential backoff. Retries any throw up to
+ * `attempts`; the final failure re-throws wrapped with `label` for context.
+ * Shared by the network fetch and the embed/insert load path so the
+ * loud-failure-after-bounded-retry contract lives in one place.
  */
-export async function fetchWithRetry<T>(
-  url: string,
+export async function withRetry<T>(
+  op: () => Promise<T>,
   label: string,
-  parse: (res: Response) => Promise<T>,
+  attempts: number = MAX_ATTEMPTS,
 ): Promise<T> {
   let lastError: unknown;
-  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers: { Accept: "application/json", "User-Agent": "ClearClass-ingest/1.0" },
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} for ${label}`);
-      return await parse(res);
+      return await op();
     } catch (err) {
       lastError = err;
-      if (attempt < MAX_FETCH_ATTEMPTS) {
+      if (attempt < attempts) {
         const backoffMs = 500 * 2 ** (attempt - 1);
+        // No module prefix here — `withRetry` is shared, so the caller's `label`
+        // carries the context (e.g. "insert 64 rows into documents"). A hardcoded
+        // prefix would misattribute retries across the ingest/embed-load paths.
         console.warn(
-          `[ingest] ${label} attempt ${attempt} failed: ${(err as Error).message} — retrying in ${backoffMs}ms`,
+          `[retry] ${label} attempt ${attempt} failed: ${(err as Error).message} — retrying in ${backoffMs}ms`,
         );
         await sleep(backoffMs);
       }
     }
   }
   throw new Error(
-    `[ingest] ${label} failed after ${MAX_FETCH_ATTEMPTS} attempts: ${(lastError as Error).message}`,
+    `${label} failed after ${attempts} attempts: ${(lastError as Error).message}`,
   );
+}
+
+/** Per-request timeout — Node's global fetch has none, so a hung socket would otherwise stall a run forever. */
+const FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Fetch `url` with a timeout and bounded exponential backoff, then run `parse`
+ * on the successful response. A non-OK HTTP status or a `parse` throw is retried;
+ * the final failure throws with `label` for context.
+ */
+export async function fetchWithRetry<T>(
+  url: string,
+  label: string,
+  parse: (res: Response) => Promise<T>,
+): Promise<T> {
+  return withRetry(async () => {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      headers: { Accept: "application/json", "User-Agent": "ClearClass-ingest/1.0" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} for ${label}`);
+    return await parse(res);
+  }, label);
 }

@@ -20,6 +20,22 @@ npm run dev                  # http://localhost:3000
 
 The home page reports LLM-gateway health via `GET /api/health`.
 
+### Corpus: schema + ingest + embed-load
+
+The retrieval corpus is built in three scripted steps against the linked
+Insforge project:
+
+```bash
+npm run migrate      # apply db schema via Insforge CLI (creates the `documents` table)
+npm run ingest       # U2/U3 — fetch + chunk HTS/GRI/rulings into data/*.jsonl
+npm run embed:load   # U4 — embed the chunks and load them into `documents` (truncates first)
+```
+
+> **Schema location:** the plan names `db/schema.sql`, but schema lives in
+> `migrations/` and is applied with the Insforge CLI (`npm run migrate` →
+> `db migrations up --all`), which tracks applied state remotely — the platform's
+> supported path for DDL. This supersedes the plan's `db/schema.sql`.
+
 ## Deployment
 
 **Live:** https://bp6d8gmu.insforge.site — health check at `/api/health`.

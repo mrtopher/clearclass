@@ -14,6 +14,8 @@
     "ingest:gri": "tsx scripts/ingest-gri.ts",
     "ingest:rulings": "tsx scripts/ingest-rulings.ts",
     "ingest": "npm run ingest:hts && npm run ingest:gri && npm run ingest:rulings",
+    "migrate": "npx @insforge/cli db migrations up --all",
+    "embed:load": "tsx --env-file-if-exists=.env.local scripts/embed-load.ts",
     "deploy": "npx @insforge/cli deployments deploy ."
   },
   "dependencies": {
