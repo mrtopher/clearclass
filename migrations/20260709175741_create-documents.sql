@@ -20,8 +20,12 @@ CREATE TABLE public.documents (
   -- ruling summary) — this is what gets embedded and what U5 returns for citation.
   content TEXT NOT NULL,
   -- text-embedding-3-small output dimension is 1536. A vector column's dimension
-  -- cannot be altered in place: to invoke the plan's DB-cap mitigation (drop to a
-  -- smaller `dimensions`), add a new column/table and re-embed rather than ALTER.
+  -- cannot be altered in place. NOTE on the plan's DB-cap mitigation: at the
+  -- ~407 MB the full corpus already occupies (of a 500 MB free tier), you CANNOT
+  -- hold a second embedding generation alongside this one, so "re-embed into a new
+  -- column" is not reachable without first dropping this column (a hard cutover) or
+  -- moving to a paid tier. To reclaim headroom, prefer re-loading at a smaller
+  -- `dimensions` (e.g. 1024/512) from a fresh, truncated table.
   embedding vector(1536) NOT NULL,
   embedding_model TEXT NOT NULL DEFAULT 'openai/text-embedding-3-small',
   -- Corpus discriminator: 'hts' | 'gri' | 'ruling'. Indexed for metadata filters.

@@ -9,7 +9,7 @@
  *
  * Usage:
  *   npm run embed:load                          # full corpus -> documents (truncates first)
- *   npx tsx scripts/embed-load.ts --limit=20 --no-truncate   # smoke a subset, append
+ *   npx tsx scripts/embed-load.ts --limit=20    # smoke the first 20 HTS chunks (appends; see below)
  *   npx tsx scripts/embed-load.ts --batch=32                 # smaller embed/insert batches
  *
  * Credentials (server-only): NEXT_PUBLIC_INSFORGE_BASE_URL + the project API key
@@ -18,17 +18,21 @@
  * shared reference data loaded out-of-band, never written by a runtime request.
  *
  * Loud-failure contract (U4): a short embedding response, a per-batch insert
- * that persists fewer rows than sent, or a final table count that disagrees
- * with the number of chunks loaded all throw — the corpus is never left silently
- * partial. The pure core (`batch`/`toRows`/`loadCorpus`) is dependency-injected
- * so this contract is unit-tested without a network or database.
+ * that persists fewer rows than sent, or a final table count that disagrees with
+ * the number of chunks loaded all throw. Because a full load truncates first and
+ * each batch auto-commits (no cross-batch transaction; the 500 MB free-tier cap
+ * rules out staging a second copy), a mid-run failure is caught and the table is
+ * emptied so the app never reads a *silently partial* corpus — a re-run restores
+ * it. A hard kill (SIGKILL) can still leave the table partial; re-run to recover.
+ * The pure core (`batch`/`toRows`/`loadCorpus`) is dependency-injected so this
+ * contract is unit-tested without a network or database.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { readJsonl, withRetry } from "@/lib/corpus-io";
-import { embedTexts } from "@/lib/llm";
+import { DEFAULT_EMBEDDING_MODEL, embedTexts } from "@/lib/llm";
 
 /** Canonical corpus artifacts produced by U2/U3. */
 const DEFAULT_CORPUS_FILES = [
@@ -55,6 +59,7 @@ export interface CorpusChunk {
 export interface DocumentRow {
   content: string;
   embedding: number[];
+  embedding_model: string;
   type: string;
   metadata: Record<string, unknown>;
 }
@@ -95,9 +100,15 @@ export function assertChunk(value: unknown, where: string): CorpusChunk {
 /**
  * Zip a batch of chunks with their embeddings into insertable rows. The 1:1
  * length check is the core no-silent-drop guard: a positional mismatch between
- * chunks and embeddings would misattribute vectors, so it throws.
+ * chunks and embeddings would misattribute vectors, so it throws. `model` is the
+ * embedding model actually used, stamped per row so the `embedding_model` column
+ * reflects reality (not the SQL default) and the re-embed mitigation can trust it.
  */
-export function toRows(chunks: readonly CorpusChunk[], embeddings: number[][]): DocumentRow[] {
+export function toRows(
+  chunks: readonly CorpusChunk[],
+  embeddings: number[][],
+  model: string,
+): DocumentRow[] {
   if (chunks.length !== embeddings.length) {
     throw new Error(
       `[embed-load] embedding count ${embeddings.length} != chunk count ${chunks.length}`,
@@ -106,6 +117,7 @@ export function toRows(chunks: readonly CorpusChunk[], embeddings: number[][]): 
   return chunks.map((c, i) => ({
     content: c.content,
     embedding: embeddings[i],
+    embedding_model: model,
     type: c.type,
     metadata: c.metadata,
   }));
@@ -130,6 +142,7 @@ export async function loadCorpus(
   chunks: readonly CorpusChunk[],
   deps: LoadDeps,
   batchSize: number = DEFAULT_BATCH_SIZE,
+  model: string = DEFAULT_EMBEDDING_MODEL,
 ): Promise<{ embedded: number; inserted: number }> {
   const groups = batch(chunks, batchSize);
   let embedded = 0;
@@ -138,7 +151,7 @@ export async function loadCorpus(
   for (let b = 0; b < groups.length; b++) {
     const group = groups[b];
     const embeddings = await deps.embed(group.map((c) => c.content));
-    const rows = toRows(group, embeddings);
+    const rows = toRows(group, embeddings, model);
     embedded += embeddings.length;
 
     const n = await deps.insert(rows);
@@ -172,8 +185,8 @@ export interface Args {
 export function parseArgs(argv: string[]): Args {
   let files = DEFAULT_CORPUS_FILES;
   let batchSize = DEFAULT_BATCH_SIZE;
-  let truncate = true;
   let limit: number | null = null;
+  let truncateFlag: boolean | null = null; // null = not explicitly set
 
   for (const arg of argv) {
     const [key, value] = arg.replace(/^--/, "").split("=");
@@ -190,9 +203,9 @@ export function parseArgs(argv: string[]): Args {
         throw new Error(`Invalid --limit value: ${JSON.stringify(value)} (expected a positive integer)`);
       }
     } else if (key === "truncate") {
-      truncate = true;
+      truncateFlag = true;
     } else if (key === "no-truncate") {
-      truncate = false;
+      truncateFlag = false;
     } else {
       throw new Error(
         `Unrecognized argument: ${JSON.stringify(arg)}. ` +
@@ -200,6 +213,12 @@ export function parseArgs(argv: string[]): Args {
       );
     }
   }
+
+  // A full run truncates by default (replace the corpus). But a subset run
+  // (`--limit`) defaults to append: silently wiping all ~24k rows to load 20 is
+  // a data-loss footgun, so wiping during a subset run requires an explicit
+  // `--truncate`. When the flag is set either way, honor it verbatim.
+  const truncate = truncateFlag ?? limit === null;
   return { files, batchSize, truncate, limit };
 }
 
@@ -252,41 +271,59 @@ function authHeaders(cfg: AdminConfig): Record<string, string> {
   return { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" };
 }
 
-/** Insert a batch, returning the number of rows the server actually persisted. */
+/** Per-request timeout — Node's global fetch has none, so a hung socket would
+ *  otherwise stall the whole ~24k-row load (and defeat `withRetry`) forever. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+function fetchAdmin(url: string, init: RequestInit): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+}
+
+/** Row total from a PostgREST `Content-Range` header ("start-end/total", e.g. "0-63/64"). */
+function contentRangeTotal(res: Response): number {
+  const total = res.headers.get("content-range")?.split("/")[1];
+  const n = total ? Number.parseInt(total, 10) : NaN;
+  return Number.isNaN(n) ? 0 : n;
+}
+
+/**
+ * Insert a batch, returning the number of rows the server persisted. Uses
+ * `return=minimal, count=exact` so the count comes from the `Content-Range`
+ * header — echoing full rows back (`return=representation`) would drag every
+ * 1536-dim vector across the wire (~148 MB over the corpus) just to count them.
+ */
 async function insertRows(cfg: AdminConfig, rows: DocumentRow[]): Promise<number> {
-  const res = await fetch(recordsUrl(cfg), {
+  const res = await fetchAdmin(recordsUrl(cfg), {
     method: "POST",
-    headers: { ...authHeaders(cfg), Prefer: "return=representation" },
+    headers: { ...authHeaders(cfg), Prefer: "return=minimal, count=exact" },
     body: JSON.stringify(rows),
   });
   if (!res.ok) {
     throw new Error(`insert HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
   }
-  const data = (await res.json()) as unknown[];
-  return Array.isArray(data) ? data.length : 0;
+  return contentRangeTotal(res);
 }
 
 /** Delete every corpus row so a re-run replaces rather than duplicates. */
 async function truncateTable(cfg: AdminConfig): Promise<void> {
   // PostgREST refuses an unfiltered delete; `id >= 0` matches all BIGSERIAL rows.
-  const res = await fetch(recordsUrl(cfg, "?id=gte.0"), {
+  const res = await fetchAdmin(recordsUrl(cfg, "?id=gte.0"), {
     method: "DELETE",
     headers: authHeaders(cfg),
   });
   if (!res.ok) {
-    throw new Error(`[embed-load] failed to truncate ${TABLE}: HTTP ${res.status}`);
+    throw new Error(`failed to truncate ${TABLE}: HTTP ${res.status}`);
   }
 }
 
 /** Authoritative row count, independent of what the inserts reported. */
 async function tableCount(cfg: AdminConfig): Promise<number> {
-  const res = await fetch(recordsUrl(cfg, "?select=id&limit=1"), {
+  const res = await fetchAdmin(recordsUrl(cfg, "?select=id&limit=1"), {
+    method: "GET",
     headers: { ...authHeaders(cfg), Prefer: "count=exact" },
   });
-  if (!res.ok) throw new Error(`[embed-load] failed to count ${TABLE}: HTTP ${res.status}`);
-  // Content-Range is "start-end/total", e.g. "0-0/23707".
-  const total = res.headers.get("content-range")?.split("/")[1];
-  return total ? Number.parseInt(total, 10) : 0;
+  if (!res.ok) throw new Error(`failed to count ${TABLE}: HTTP ${res.status}`);
+  return contentRangeTotal(res);
 }
 
 async function main(): Promise<void> {
@@ -314,13 +351,15 @@ async function main(): Promise<void> {
   const cfg = resolveAdminConfig();
 
   if (truncate) {
-    await truncateTable(cfg);
+    await withRetry(() => truncateTable(cfg), `truncate ${TABLE}`);
     console.log(`[embed-load] truncated ${TABLE}`);
   }
 
   const deps: LoadDeps = {
-    // embedMany (inside embedTexts) owns embed retry/backoff and parallelism.
-    embed: (texts) => embedTexts(texts),
+    // embedMany owns intra-call retry/parallelism; withRetry adds a bounded outer
+    // layer so a whole-batch gateway blip (429 storm, socket reset) is survivable
+    // on an unattended run rather than aborting the load.
+    embed: (texts) => withRetry(() => embedTexts(texts), `embed ${texts.length} texts`),
     insert: (rows) =>
       withRetry(() => insertRows(cfg, rows), `insert ${rows.length} rows into ${TABLE}`),
     onBatch: ({ inserted, total }) => {
@@ -330,10 +369,30 @@ async function main(): Promise<void> {
     },
   };
 
-  const { embedded, inserted } = await loadCorpus(toLoad, deps, batchSize);
+  let result: { embedded: number; inserted: number };
+  try {
+    result = await loadCorpus(toLoad, deps, batchSize);
+  } catch (err) {
+    // A truncating run already emptied the table, and batches auto-commit, so a
+    // mid-load failure leaves a partial corpus. Fail SAFE to empty: an empty
+    // table is an obvious "not loaded" state (retrieval plainly returns nothing),
+    // whereas a partial one silently serves incomplete results. Best-effort — a
+    // hard kill can't run this; re-run to recover either way.
+    if (truncate) {
+      await withRetry(() => truncateTable(cfg), `truncate ${TABLE} (rollback)`).catch(
+        (rollbackErr) =>
+          console.error(
+            `[embed-load] WARNING: failed to empty a partially-loaded ${TABLE}; ` +
+              `it may hold a partial corpus — re-run to restore. (${(rollbackErr as Error).message})`,
+          ),
+      );
+    }
+    throw err;
+  }
+  const { embedded, inserted } = result;
 
   // Cross-check against the table itself, not just what the inserts reported.
-  const finalCount = await tableCount(cfg);
+  const finalCount = await withRetry(() => tableCount(cfg), `count ${TABLE}`);
   const expected = truncate ? inserted : "(appended; see table)";
   console.log(
     `\n[embed-load] done: embedded ${embedded}, inserted ${inserted}; ` +

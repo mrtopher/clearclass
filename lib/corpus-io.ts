@@ -75,15 +75,18 @@ export async function withRetry<T>(
       lastError = err;
       if (attempt < attempts) {
         const backoffMs = 500 * 2 ** (attempt - 1);
+        // No module prefix here — `withRetry` is shared, so the caller's `label`
+        // carries the context (e.g. "insert 64 rows into documents"). A hardcoded
+        // prefix would misattribute retries across the ingest/embed-load paths.
         console.warn(
-          `[ingest] ${label} attempt ${attempt} failed: ${(err as Error).message} — retrying in ${backoffMs}ms`,
+          `[retry] ${label} attempt ${attempt} failed: ${(err as Error).message} — retrying in ${backoffMs}ms`,
         );
         await sleep(backoffMs);
       }
     }
   }
   throw new Error(
-    `[ingest] ${label} failed after ${attempts} attempts: ${(lastError as Error).message}`,
+    `${label} failed after ${attempts} attempts: ${(lastError as Error).message}`,
   );
 }
 

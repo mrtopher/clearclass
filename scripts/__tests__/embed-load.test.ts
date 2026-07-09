@@ -64,16 +64,16 @@ describe("assertChunk", () => {
 });
 
 describe("toRows", () => {
-  it("zips chunks with embeddings positionally", () => {
-    const rows = toRows([chunk("a"), chunk("b")], [[1, 1, 1], [2, 2, 2]]);
+  it("zips chunks with embeddings positionally and stamps the model used", () => {
+    const rows = toRows([chunk("a"), chunk("b")], [[1, 1, 1], [2, 2, 2]], "test-model");
     expect(rows).toEqual<DocumentRow[]>([
-      { content: "a", embedding: [1, 1, 1], type: "hts", metadata: { hts_code: "0000.00.00.00" } },
-      { content: "b", embedding: [2, 2, 2], type: "hts", metadata: { hts_code: "0000.00.00.00" } },
+      { content: "a", embedding: [1, 1, 1], embedding_model: "test-model", type: "hts", metadata: { hts_code: "0000.00.00.00" } },
+      { content: "b", embedding: [2, 2, 2], embedding_model: "test-model", type: "hts", metadata: { hts_code: "0000.00.00.00" } },
     ]);
   });
 
   it("throws when embedding count != chunk count (no misattributed vectors)", () => {
-    expect(() => toRows([chunk("a"), chunk("b")], [[1, 1, 1]])).toThrow(
+    expect(() => toRows([chunk("a"), chunk("b")], [[1, 1, 1]], "m")).toThrow(
       /embedding count 1 != chunk count 2/,
     );
   });
@@ -102,9 +102,10 @@ describe("loadCorpus", () => {
         return Promise.resolve(rows.length);
       },
     };
-    await loadCorpus([chunk("x"), chunk("y")], deps, 10);
+    await loadCorpus([chunk("x"), chunk("y")], deps, 10, "model-xyz");
     expect(captured[0].embedding).toEqual([0, 1, 2]);
     expect(captured[1].embedding).toEqual([1, 2, 3]);
+    expect(captured.every((r) => r.embedding_model === "model-xyz")).toBe(true);
   });
 
   it("throws when a batch inserts fewer rows than sent (silent-drop guard)", async () => {
@@ -127,7 +128,7 @@ describe("loadCorpus", () => {
 });
 
 describe("parseArgs", () => {
-  it("defaults to the three canonical corpora, batch 64, truncate on", () => {
+  it("defaults to the three canonical corpora, batch 64, truncate on for a full run", () => {
     const args = parseArgs([]);
     expect(args.batchSize).toBe(64);
     expect(args.truncate).toBe(true);
@@ -138,6 +139,14 @@ describe("parseArgs", () => {
   it("parses --limit, --batch, and --no-truncate", () => {
     const args = parseArgs(["--limit=20", "--batch=8", "--no-truncate"]);
     expect(args).toMatchObject({ limit: 20, batchSize: 8, truncate: false });
+  });
+
+  it("does NOT truncate on a subset run by default (data-loss footgun guard)", () => {
+    expect(parseArgs(["--limit=20"]).truncate).toBe(false);
+  });
+
+  it("honors an explicit --truncate even with --limit", () => {
+    expect(parseArgs(["--limit=20", "--truncate"]).truncate).toBe(true);
   });
 
   it("rejects an unrecognized flag rather than silently ignoring it", () => {
