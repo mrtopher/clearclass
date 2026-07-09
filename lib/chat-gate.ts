@@ -9,8 +9,8 @@
  * for an importer the broker is not a member of (the U11 verification contract).
  * The billable loop is an injectable seam (`ChatDeps.runAgent`) precisely so the
  * gate is provable without any model call — tests inject a spy and assert it is
- * never reached on the rejected paths. The whole loop (once U6 wires it) runs
- * server-side only (KTD11).
+ * never reached on the rejected paths. The whole loop runs server-side only
+ * (KTD11); U6 wired the real agent as `defaultDeps.runAgent`.
  */
 import { NextResponse } from "next/server";
 
@@ -19,6 +19,7 @@ import {
   type ResolveTenantResult,
   type TenantContext,
 } from "@/lib/auth";
+import { createRunAgent } from "@/lib/agent";
 
 /** The billable agent loop U6 will implement, behind the gate this unit establishes. */
 export type RunAgent = (input: {
@@ -31,25 +32,12 @@ export interface ChatDeps {
   runAgent: RunAgent;
 }
 
-/**
- * Placeholder billable path until U6. It makes NO model/search/rerank call — it
- * only echoes the server-derived scope, proving the gate resolved a real tenant
- * (the importer here comes from the verified token, never the client's request).
- */
-const notYetImplemented: RunAgent = async ({ tenant }) =>
-  NextResponse.json(
-    {
-      status: "authenticated",
-      importerId: tenant.importerId,
-      memberships: tenant.memberships,
-      note: "Auth gate active (U11). The classification agent loop lands in U6.",
-    },
-    { status: 200 },
-  );
-
 const defaultDeps: ChatDeps = {
   resolveTenant,
-  runAgent: notYetImplemented,
+  // U6: the real agentic classification loop, run only after the gate resolves a
+  // verified principal + server-derived importer. Built once here (lazy config —
+  // constructing it needs no credentials); the model call fires only per request.
+  runAgent: createRunAgent(),
 };
 
 /**
