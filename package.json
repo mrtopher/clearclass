@@ -18,6 +18,7 @@
     "embed:load": "tsx --env-file-if-exists=.env.local scripts/embed-load.ts",
     "eval:recall": "tsx --env-file-if-exists=.env.local eval/retrieval-recall.ts",
     "verify:rls": "tsx --env-file-if-exists=.env.local scripts/verify-rls.ts",
+    "seed:demo": "tsx --env-file-if-exists=.env.local scripts/seed-demo-broker.ts",
     "deploy": "npx @insforge/cli deployments deploy ."
   },
   "dependencies": {
