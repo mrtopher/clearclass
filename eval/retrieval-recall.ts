@@ -26,15 +26,19 @@
  * Exit code: non-zero when recall is IMPLAUSIBLY LOW (a chunking-defect alarm),
  * so `npm run eval:recall` works as the Verification Contract gate for U5.
  */
-import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { readJsonl, withRetry } from "@/lib/corpus-io";
+import { withRetry } from "@/lib/corpus-io";
 import { createFetchSearch, type RetrievedChunk } from "@/lib/retrieval/dense";
 import { resolveAdminConfig } from "@/lib/insforge-admin";
 import { embedTexts } from "@/lib/llm";
+import { DEFAULT_SPLIT, cleanQuery, loadTestRows, type TestRow } from "@/eval/dataset";
 
-const DEFAULT_SPLIT = "data/eval-test-split.jsonl";
+// Dataset loading and query normalization moved to `eval/dataset.ts` (shared with
+// the U10 accuracy/RAG suites); re-exported here so existing callers and this
+// module's tests keep importing them from `@/eval/retrieval-recall` unchanged.
+export { DEFAULT_SPLIT, cleanQuery, type TestRow };
+
 const DEFAULT_KS = [5, 10, 20];
 const DEFAULT_DIGITS = [6, 10];
 
@@ -46,34 +50,6 @@ const DEFAULT_DIGITS = [6, 10];
  * alarm the plan calls for, not a fine-grained quality bar.
  */
 export const IMPLAUSIBLY_LOW_RECALL = 0.2;
-
-/** One eval test row: a product-description question and its gold HTS code. */
-export interface TestRow {
-  description: string;
-  gold_hts: string;
-}
-
-/**
- * The eval dataset phrases every row as a chat question — "What is the HTS US
- * Code for <product>?" — which is a dataset artifact, NOT what U6's agent sends
- * the retrieve tool (a broker submits a product description, not a question).
- * Embedding the interrogative framing pushes the query vector toward "question"
- * text and away from the terse tariff-line language, depressing recall on a
- * scenario that never occurs in production. Stripping it to the bare product
- * phrase measures retrieval as the agent will actually exercise it. Light touch
- * only (prefix + trailing "?"): case and content are preserved so the embedding
- * still sees natural language, unlike the aggressive tokenizer in `lib/rulings`.
- */
-const QUESTION_PREFIX =
-  /^\s*what\s+is\s+the\s+(hts|harmonized|tariff|classification|proper)\b[^?]*?\b(for|of)\s+/i;
-
-export function cleanQuery(text: string): string {
-  const collapsed = text.trim().replace(/\s+/g, " ");
-  const stripped = collapsed.replace(QUESTION_PREFIX, "").replace(/\?+\s*$/, "").trim();
-  // Never hand back an empty query (a row that was ALL boilerplate) — fall back
-  // to the original so the row is still scored rather than silently short-circuited.
-  return stripped || collapsed;
-}
 
 /** Digits-only view of an HTS code, so `0101.21.00.10` and `0101210010` compare equal. */
 export function codeDigits(code: string): string {
@@ -270,25 +246,6 @@ export function parseArgs(argv: string[]): RecallArgs {
     }
   }
   return { split, ks, digits, limit };
-}
-
-/** Load and validate the eval test split; a row missing description/gold code is fatal. */
-async function loadTestRows(split: string, limit: number | null): Promise<TestRow[]> {
-  const absPath = resolve(process.cwd(), split);
-  const raw = await readJsonl<Partial<TestRow>>(absPath);
-  // `i` is the record ordinal from readJsonl (which skips blank lines), NOT a
-  // file line number — label it as a row index so it doesn't misdirect debugging.
-  const rows: TestRow[] = raw.map((r, i) => {
-    if (!r || typeof r.description !== "string" || !r.description.trim()) {
-      throw new Error(`[eval:recall] ${split} row ${i + 1} is missing a description`);
-    }
-    if (typeof r.gold_hts !== "string" || !r.gold_hts.trim()) {
-      throw new Error(`[eval:recall] ${split} row ${i + 1} is missing a gold_hts code`);
-    }
-    return { description: r.description.trim(), gold_hts: r.gold_hts.trim() };
-  });
-  if (rows.length === 0) throw new Error(`[eval:recall] ${split} has no rows — aborting.`);
-  return limit ? rows.slice(0, limit) : rows;
 }
 
 async function main(): Promise<void> {

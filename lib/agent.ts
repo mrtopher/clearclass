@@ -342,6 +342,24 @@ export class BadInputError extends Error {
 }
 
 /**
+ * Raised when a candidate survives citation validation with NO corpus-backed
+ * citation — an indefensible code the loop refuses to return (the defensibility
+ * floor below). Typed distinctly from a transport/model failure so callers can
+ * tell "the system declined to produce a defensible answer" from "the request
+ * errored": `createRunAgent` still maps it to the flagged 502, but the U10 eval
+ * scores it as a MISS (a real product failure) rather than dropping the row as an
+ * error — otherwise accuracy would be inflated by excluding declined rows, and
+ * two retrieval arms that decline different rows would be compared over different
+ * denominators.
+ */
+export class IndefensibleClassificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IndefensibleClassificationError";
+  }
+}
+
+/**
  * Normalize whatever the client sent into model messages. Accepts a bare string
  * (convenience), UI messages from `useChat` (converted), or already-model
  * messages (passed through). An empty/blank/wrong-typed input throws
@@ -444,7 +462,7 @@ export async function runClassification(
     (c) => !c.citations.some((cit) => cit.source === "corpus"),
   );
   if (indefensible) {
-    throw new Error(
+    throw new IndefensibleClassificationError(
       `[agent] candidate ${indefensible.hts_code} has no corpus-backed citation after validation`,
     );
   }
@@ -464,8 +482,13 @@ export const GENERATE_TIMEOUT_MS = 30_000;
 
 /** The default model call: a buffered multi-step `generateText` loop that forces
  *  the structured classification shape. `chatModel()` is resolved lazily here so
- *  building the agent never requires gateway credentials at import time. */
-async function defaultGenerate(args: GenerateArgs): Promise<GenerateResult> {
+ *  building the agent never requires gateway credentials at import time.
+ *
+ *  Exported so the U10 eval harness can drive the REAL model loop through
+ *  `runClassification` directly — measuring the shipping classification path
+ *  without the per-importer memory side-effects `createRunAgent` layers on
+ *  (an eval must not write precedent rows into the live `classifications` table). */
+export async function defaultGenerate(args: GenerateArgs): Promise<GenerateResult> {
   const result = await generateText({
     model: chatModel(),
     system: args.system,
