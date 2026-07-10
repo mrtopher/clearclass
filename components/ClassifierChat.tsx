@@ -34,12 +34,29 @@ type Status =
   | { kind: "error"; message: string }
   | { kind: "done"; result: ClassificationResult };
 
+/**
+ * Structurally validate a 200 body before rendering. The server (U6) already
+ * validates the full shape with Zod before responding, so this is DEFENSIVE — but
+ * it must check the whole shape the view touches, not just `candidates`:
+ * `ClassificationView` reads `recommendation.hts_code`, `why_not.map`, and
+ * `sources_used.corpus`, so a partial body would `TypeError` mid-render (there is
+ * no error boundary here) instead of taking the clean `chatErrorMessage(502)`
+ * path. A lightweight structural check (not `classificationSchema.safeParse`)
+ * keeps Zod out of the client bundle — the authoritative validation is the
+ * server's, this is only a crash guard.
+ */
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
 function looksLikeResult(data: unknown): data is ClassificationResult {
+  if (!isObject(data)) return false;
   return (
-    typeof data === "object" &&
-    data !== null &&
-    Array.isArray((data as ClassificationResult).candidates) &&
-    (data as ClassificationResult).candidates.length === 3
+    Array.isArray(data.candidates) &&
+    data.candidates.length === 3 &&
+    isObject(data.recommendation) &&
+    Array.isArray(data.why_not) &&
+    isObject(data.sources_used)
   );
 }
 
@@ -164,7 +181,10 @@ function ClassificationView({ result }: { result: ClassificationResult }) {
         </span>
       </div>
       {candidates.map((candidate) => (
-        <CandidateCard key={candidate.hts_code} candidate={candidate} />
+        // Key by rank, not hts_code: the schema enforces exactly 3 candidates but
+        // NOT distinct codes, and the list is rendered once (never reordered), so
+        // rank is the stable, collision-free key.
+        <CandidateCard key={candidate.rank} candidate={candidate} />
       ))}
     </section>
   );

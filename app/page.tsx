@@ -20,6 +20,14 @@ import { signOut } from "@/app/actions";
 import { ClassifierChat } from "@/components/ClassifierChat";
 import { LoginForm } from "@/components/LoginForm";
 
+// This page reads the session cookie (via resolveTenant → cookies()), so it must
+// render per-request. Declared explicitly — mirroring `app/api/chat/route.ts` —
+// rather than relying on Next's implicit dynamic detection: `resolveSession`'s
+// blanket catch would otherwise swallow the `DYNAMIC_SERVER_USAGE` bailout signal
+// `cookies()` raises during static prerender, and a slip in detection would cache
+// the signed-out login view for every user.
+export const dynamic = "force-dynamic";
+
 /**
  * Resolve the session, failing CLOSED to "unauthenticated" if the auth backend
  * is unreachable or misconfigured. `resolveTenant` already fails closed when

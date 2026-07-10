@@ -12,19 +12,26 @@ import type { Citation } from "@/lib/schema";
 
 export function CitationItem({ citation }: { citation: Citation }) {
   if (citation.source === "web") {
+    // Only render an actual link for an http(s) URL. React does not sanitize
+    // `href`, so a `javascript:`/`data:` URL would execute on click. The server
+    // already drops any web citation whose URL wasn't returned by Tavily
+    // (`lib/agent.ts#isValidWebCitation`), so this is defense-in-depth against a
+    // future widening of the citation source — not a live hole today.
+    const safeUrl =
+      citation.url && /^https?:\/\//i.test(citation.url) ? citation.url : null;
     return (
       <li className="flex flex-col gap-0.5 text-sm">
         <span className="inline-flex w-fit items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300">
           Web
         </span>
-        {citation.url ? (
+        {safeUrl ? (
           <a
-            href={citation.url}
+            href={safeUrl}
             target="_blank"
             rel="noopener noreferrer"
             className="break-all text-blue-600 underline underline-offset-2 hover:text-blue-500 dark:text-blue-400"
           >
-            {citation.title ?? citation.url}
+            {citation.title ?? safeUrl}
           </a>
         ) : (
           <span className="text-neutral-500">{citation.title ?? "Web source"}</span>
