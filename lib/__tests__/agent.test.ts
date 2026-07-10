@@ -120,6 +120,23 @@ describe("buildSystemPrompt", () => {
     expect(p).toContain(WEB_SEARCH_TOOL);
   });
 
+  it("mentions JSON and specifies the exact output shape (gateway json_object requirement)", () => {
+    // Regression guard for the live-gateway bug: `experimental_output` runs the
+    // OpenAI-compatible provider in `json_object` mode, which (a) 400s unless the
+    // prompt contains the word "json", and (b) does NOT send the schema to the
+    // model — so the prompt must spell out the exact field names or the model
+    // free-forms the wrong shape (e.g. "recommended" string, why_not as a map,
+    // no citations) and Zod validation rejects it. Neither is caught by the
+    // fake-`generate` tests, so this locks the prompt contract in place.
+    const p = buildSystemPrompt().toLowerCase();
+    expect(p).toContain("json");
+    // The exact schema key names the model must emit.
+    expect(p).toContain("candidates");
+    expect(p).toContain("citations");
+    expect(p).toContain('"recommendation"');
+    expect(p).toContain('"why_not"');
+  });
+
   it("injects importer precedent when provided (the U7 hook) and omits it otherwise", () => {
     expect(buildSystemPrompt()).not.toContain("Prior classifications");
     const withPrecedent = buildSystemPrompt({ precedent: "0101.21 — live horses" });
