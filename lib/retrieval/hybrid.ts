@@ -104,12 +104,21 @@ export function reciprocalRankFusion(
 }
 
 /**
- * Hybrid retrieval: embed the query, run the dense and lexical arms in parallel
- * over a candidate pool, and return the RRF-fused ranked pool (deduped). This is
- * the reranker's input; when the reranker is unavailable the caller can use this
- * fused order directly (the "rerank failure falls back to fused-hybrid order"
- * degradation). A blank / whitespace-only query short-circuits to `[]` WITHOUT
- * embedding, matching `denseRetrieve` — no vector, no billable embed call.
+ * Hybrid retrieval: run the dense and lexical arms over a candidate pool and
+ * return the RRF-fused ranked pool (deduped). This is the reranker's input; when
+ * the reranker is unavailable the caller can use this fused order directly (the
+ * "rerank failure falls back to fused-hybrid order" degradation). A blank /
+ * whitespace-only query short-circuits to `[]` WITHOUT embedding, matching
+ * `denseRetrieve` — no vector, no billable embed call.
+ *
+ * DEGRADE, DON'T CRASH (matching the rerank stage and `tavily`): the arms run via
+ * `Promise.allSettled`, so ONE arm failing (a transient lexical-RPC error, an
+ * embed hiccup on the dense arm) fuses over whichever arm survived rather than
+ * failing the whole billable classification — hybrid mode must never be WORSE
+ * than the dense baseline it extends. Only when BOTH arms fail (a genuine
+ * retrieval outage, nothing to fuse) does it throw. The embed lives inside the
+ * dense arm so an embed failure degrades to lexical-only rather than taking down
+ * both.
  */
 export async function hybridRetrieve(
   query: string,
@@ -119,12 +128,31 @@ export async function hybridRetrieve(
   const trimmed = query.trim();
   if (!trimmed) return [];
   const poolK = clampK(opts.candidatePool ?? CANDIDATE_POOL);
-  const embedding = await deps.embed(trimmed);
-  const [dense, lexical] = await Promise.all([
-    deps.denseSearch(embedding, { k: poolK, type: opts.type }),
+
+  const [dense, lexical] = await Promise.allSettled([
+    (async () => {
+      const embedding = await deps.embed(trimmed);
+      return deps.denseSearch(embedding, { k: poolK, type: opts.type });
+    })(),
     deps.lexicalSearch(trimmed, { k: poolK, type: opts.type }),
   ]);
-  return reciprocalRankFusion([dense, lexical]);
+
+  const lists: RetrievedChunk[][] = [];
+  if (dense.status === "fulfilled") lists.push(dense.value);
+  else console.warn(`[hybrid] dense arm failed; fusing over lexical only: ${dense.reason}`);
+  if (lexical.status === "fulfilled") lists.push(lexical.value);
+  else console.warn(`[hybrid] lexical arm failed; fusing over dense only: ${lexical.reason}`);
+
+  if (lists.length === 0) {
+    // Both arms are down — there is genuinely nothing to retrieve. Fail loud so
+    // the agent returns its flagged 502 rather than synthesizing an ungrounded
+    // (indefensible) answer from an empty corpus.
+    throw new Error(
+      `[hybrid] both retrieval arms failed: dense=${(dense as PromiseRejectedResult).reason}; ` +
+        `lexical=${(lexical as PromiseRejectedResult).reason}`,
+    );
+  }
+  return reciprocalRankFusion(lists);
 }
 
 const LEXICAL_RPC = "match_documents_lexical";

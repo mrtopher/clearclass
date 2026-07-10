@@ -55,9 +55,15 @@ describe("rerankChunks", () => {
     expect(out.map((c) => c.id)).toEqual([1, 2]);
   });
 
-  it("skips an out-of-range index so a bad response can't fabricate/duplicate a chunk", async () => {
+  it("skips an out-of-range index so a bad response can't fabricate a chunk", async () => {
     // index 9 doesn't exist; only 2 and 0 map to real chunks.
     const out = await rerankChunks("q", fused, 4, { rerank: rankTo([9, 2, 0]) });
+    expect(out.map((c) => c.id)).toEqual([3, 1]);
+  });
+
+  it("skips a REPEATED index so a bad response can't duplicate a chunk", async () => {
+    // index 2 appears twice; chunk 3 must surface once, not twice.
+    const out = await rerankChunks("q", fused, 4, { rerank: rankTo([2, 2, 0]) });
     expect(out.map((c) => c.id)).toEqual([3, 1]);
   });
 
@@ -87,6 +93,7 @@ describe("createCohereRerank", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     delete process.env.COHERE_API_KEY;
+    delete process.env.COHERE_RERANK_MODEL;
   });
 
   it("posts query + documents to the Cohere endpoint with auth and coerces results", async () => {
@@ -110,6 +117,17 @@ describe("createCohereRerank", () => {
     expect(sent.documents).toEqual(["a", "b"]);
     expect(sent.top_n).toBe(2);
     expect(typeof sent.model).toBe("string");
+  });
+
+  it("honours a COHERE_RERANK_MODEL override set after import (resolved at call time)", async () => {
+    process.env.COHERE_API_KEY = "co-key";
+    process.env.COHERE_RERANK_MODEL = "rerank-english-v3.0";
+    const fetchMock = vi.fn((_url: string, _init: RequestInit) =>
+      Promise.resolve(fakeResponse({ ok: true, json: okBody })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await createCohereRerank()("q", ["a"], { topN: 1 });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).model).toBe("rerank-english-v3.0");
   });
 
   it("throws when COHERE_API_KEY is missing (caught upstream → fused fallback)", async () => {

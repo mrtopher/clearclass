@@ -57,7 +57,13 @@ AS $$
     -- unmatched row has rank 0 and would only dilute the fused candidate set.
     d.content_tsv @@ websearch_to_tsquery('english', query_text)
     AND (filter_type IS NULL OR d.type = filter_type)
-  ORDER BY similarity DESC
+  -- Tiebreaker on id is load-bearing here (more than for the dense cosine RPC):
+  -- ts_rank produces EQUAL scores far more often than near-unique cosine
+  -- distances — short lexical matches routinely tie — and equal-rank rows in
+  -- DB-arbitrary order would shift their RRF rank position run-to-run, making the
+  -- fused pool (and the reranked top-k) non-deterministic. U9's contract is that
+  -- the mode flag changes results DETERMINISTICALLY, so pin the order.
+  ORDER BY similarity DESC, d.id
   -- Guard against a non-positive match_count producing a LIMIT 0 / error; the
   -- retriever also clamps, but defense in depth keeps a stray RPC call sane.
   LIMIT GREATEST(match_count, 1);

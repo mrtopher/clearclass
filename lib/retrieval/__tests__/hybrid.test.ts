@@ -108,6 +108,40 @@ describe("hybridRetrieve", () => {
     expect(deps.denseSearch).not.toHaveBeenCalled();
     expect(deps.lexicalSearch).not.toHaveBeenCalled();
   });
+
+  it("degrades to DENSE-only when the lexical arm fails (never worse than the baseline)", async () => {
+    const deps = fakeDeps({
+      denseSearch: vi.fn(async () => [chunk(1), chunk(2)]),
+      lexicalSearch: vi.fn(async () => {
+        throw new Error("lexical RPC 500");
+      }),
+    });
+    const out = await hybridRetrieve("cotton shirt", {}, deps);
+    expect(out.map((c) => c.id)).toEqual([1, 2]); // dense arm carried the query
+  });
+
+  it("degrades to LEXICAL-only when the dense arm (embed) fails", async () => {
+    const deps = fakeDeps({
+      embed: vi.fn(async () => {
+        throw new Error("gateway down");
+      }),
+      lexicalSearch: vi.fn(async () => [chunk(7), chunk(8)]),
+    });
+    const out = await hybridRetrieve("cotton shirt", {}, deps);
+    expect(out.map((c) => c.id)).toEqual([7, 8]); // lexical arm carried the query
+  });
+
+  it("throws only when BOTH arms fail (genuine outage — nothing to fuse)", async () => {
+    const deps = fakeDeps({
+      denseSearch: vi.fn(async () => {
+        throw new Error("dense down");
+      }),
+      lexicalSearch: vi.fn(async () => {
+        throw new Error("lexical down");
+      }),
+    });
+    await expect(hybridRetrieve("cotton shirt", {}, deps)).rejects.toThrow(/both retrieval arms failed/);
+  });
 });
 
 describe("createFetchLexicalSearch", () => {

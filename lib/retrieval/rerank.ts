@@ -48,9 +48,11 @@ const COHERE_ENDPOINT = "https://api.cohere.com/v2/rerank";
  *  `rerankChunks` turns into graceful fused-order degradation. */
 export const COHERE_TIMEOUT_MS = 10_000;
 
-/** Cohere rerank model. `rerank-v3.5` is the current general model; override via
- *  env if a cheaper/English-only model is preferred. */
-export const DEFAULT_RERANK_MODEL = process.env.COHERE_RERANK_MODEL ?? "rerank-v3.5";
+/** Cohere rerank model when `COHERE_RERANK_MODEL` is unset. `rerank-v3.5` is the
+ *  current general model. The env override is resolved at CALL time (see
+ *  `createCohereRerank`), matching this module's deferred-resolution pattern for
+ *  every other env read, so a value set after import is still honoured. */
+export const DEFAULT_RERANK_MODEL = "rerank-v3.5";
 
 /** Parse Cohere's `{ results: [{ index, relevance_score }] }` into `RerankResult[]`,
  *  dropping any row without a numeric index (a malformed row must not shift the
@@ -93,7 +95,7 @@ export function createCohereRerank(): RerankFn {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: DEFAULT_RERANK_MODEL,
+        model: process.env.COHERE_RERANK_MODEL ?? DEFAULT_RERANK_MODEL,
         query,
         documents,
         top_n: topN,
@@ -132,9 +134,16 @@ export async function rerankChunks(
       topN: n,
     });
     const reordered: RetrievedChunk[] = [];
+    const seen = new Set<number>();
     for (const r of ranked) {
+      // Skip an out-of-range OR repeated index so a bad response can never
+      // fabricate or DUPLICATE a chunk (the documented invariant).
+      if (seen.has(r.index)) continue;
       const chunk = chunks[r.index];
-      if (chunk) reordered.push(chunk);
+      if (chunk) {
+        seen.add(r.index);
+        reordered.push(chunk);
+      }
     }
     // A response that mapped to nothing usable is as good as a failure — keep the
     // fused order rather than return an empty (or partial-garbage) result.
