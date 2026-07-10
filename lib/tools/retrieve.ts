@@ -12,7 +12,8 @@
 import { tool } from "ai";
 import { z } from "zod";
 
-import { createDenseRetriever, type DenseRetriever, type RetrievedChunk } from "@/lib/retrieval/dense";
+import { type DenseRetriever, type RetrievedChunk } from "@/lib/retrieval/dense";
+import { createConfiguredRetriever } from "@/lib/retrieval";
 
 /** The citation-ready projection of a retrieved chunk the agent renders. */
 export interface Citation {
@@ -75,12 +76,13 @@ export interface RetrieveResult {
 }
 
 /**
- * Build the retrieve tool bound to a dense retriever. The retriever defaults to
- * the live gateway + RPC transport but is injectable so U6's route and tests can
- * supply their own. Kept as a factory (not a bare singleton that resolves admin
- * config at import) so importing this module never requires credentials.
+ * Build the retrieve tool bound to a retriever. Defaults to the CONFIGURED
+ * retriever (U9) — dense baseline or hybrid+rerank per `RETRIEVAL_MODE`, dense
+ * unless the flag flips — but is injectable so U6's route and tests can supply
+ * their own. Kept as a factory (not a bare singleton that resolves admin config
+ * at import) so importing this module never requires credentials.
  */
-export function createRetrieveTool(retriever: DenseRetriever = createDenseRetriever()) {
+export function createRetrieveTool(retriever: DenseRetriever = createConfiguredRetriever()) {
   return tool({
     description:
       "Search the grounded corpus (US HTS tariff lines, the General Rules of Interpretation, and seeded CBP CROSS rulings) for chunks relevant to a product. Returns ranked, citable chunks; cite classifications ONLY to the chunk ids this returns.",
