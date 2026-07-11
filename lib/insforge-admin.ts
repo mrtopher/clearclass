@@ -66,8 +66,14 @@ export function authHeaders(cfg: AdminConfig): Record<string, string> {
  * otherwise stall a whole load/retrieval run (and defeat `withRetry`) forever.
  * Module-private (matches `corpus-io`'s `FETCH_TIMEOUT_MS`) — only `adminFetch`
  * consumes it; callers use `adminFetch`, not the raw constant.
+ *
+ * Defaults to 30s (unchanged for the runtime retriever). Offline bulk loads can
+ * raise it via INSFORGE_ADMIN_TIMEOUT_MS — a large vector insert can exceed 30s
+ * when the DB instance is briefly slow, and a client abort there risks a
+ * server-side commit the client never sees (duplicate rows on retry).
  */
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS =
+  Number.parseInt(process.env.INSFORGE_ADMIN_TIMEOUT_MS ?? "", 10) || 30_000;
 
 export function adminFetch(url: string, init: RequestInit): Promise<Response> {
   return fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
