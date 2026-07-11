@@ -114,6 +114,13 @@ export interface RecallSuite {
   results: RecallResult[];
   scored: number;
   errors: number;
+  /**
+   * Advanced arm only: rows whose Cohere rerank degraded to fused-hybrid order
+   * (rate-limit/outage/missing key). Undefined for the dense arm (never reranks).
+   * A high value means the "hybrid+rerank" numbers actually measure fused-hybrid —
+   * `renderReport` surfaces this so a degraded run can't masquerade as a real one.
+   */
+  rerankFallbacks?: number;
 }
 
 /** Per-mode end-to-end accuracy suite result. */
@@ -156,6 +163,36 @@ export interface ReportData {
 
 /** The advanced arm; `dense` is always the baseline the delta is measured from. */
 const ADVANCED_MODE: RetrievalMode = "hybrid+rerank";
+
+/**
+ * Fraction of the advanced arm's rows that must have fallen back to fused-hybrid
+ * order before the report flags the run as degraded. Mirrors the recall harness's
+ * `MAX_ERROR_RATE` (0.1): a stray 1/200 fallback is noise, but once a MEANINGFUL
+ * share of reranks never ran, the "hybrid+rerank" column is measuring fused-hybrid
+ * and must say so. Fail-closed like AE4 — never present an unmeasured component
+ * (the reranker) as measured.
+ */
+export const RERANK_FALLBACK_WARN_FRACTION = 0.1;
+
+/**
+ * A blockquote warning when the advanced arm's reranker silently degraded on a
+ * meaningful fraction of rows, else `null` (dense arm, no data, or a clean run).
+ * Rendered right under the recall table so the caveat is read BEFORE the headline
+ * lift — the number below rests on fused-hybrid order, not reranked order.
+ */
+function rerankHealthNote(recall: readonly RecallSuite[]): string | null {
+  const adv = suiteFor(recall, ADVANCED_MODE);
+  if (!adv || adv.rerankFallbacks == null || adv.scored <= 0) return null;
+  const n = adv.rerankFallbacks;
+  if (n / adv.scored < RERANK_FALLBACK_WARN_FRACTION) return null;
+  return (
+    `> ⚠️ **Advanced arm degraded — the reranker did not run on ${n}/${adv.scored} rows.** ` +
+    "Those reranks fell back to fused-hybrid (RRF) order because the Cohere rerank call failed " +
+    "(rate-limit / outage / missing `COHERE_API_KEY`). For those rows the `hybrid+rerank` column " +
+    "above measures **fused-hybrid, not reranked** retrieval — re-run with a healthy Cohere key " +
+    "before trusting the advanced numbers or the headline lift."
+  );
+}
 
 function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`;
@@ -333,6 +370,11 @@ export function renderReport(data: ReportData): string {
     ),
   );
   lines.push("");
+  const rerankNote = rerankHealthNote(data.recall);
+  if (rerankNote) {
+    lines.push(rerankNote);
+    lines.push("");
+  }
   const lift = headlineRecallLift(data);
   if (lift) {
     const cellCount = data.ks.length * data.recallDigits.length;

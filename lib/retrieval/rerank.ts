@@ -39,6 +39,16 @@ export type RerankFn = (
 
 export interface RerankDeps {
   rerank: RerankFn;
+  /**
+   * Optional health sink, fired ONCE per call whenever this rerank degrades to
+   * fused-hybrid order because the cross-encoder did not produce a usable ranking
+   * (an outage/timeout/missing-key throw, or a response that mapped to nothing).
+   * It is NOT fired for the blank-query / empty-pool early returns — those are
+   * "nothing to rank", not a reranker failure. The eval harness counts these to
+   * make a degraded run (e.g. Cohere rate-limited) LOUD in `eval/report.md`
+   * instead of silently reporting fused-hybrid numbers as "reranked".
+   */
+  onFallback?: () => void;
 }
 
 const COHERE_ENDPOINT = "https://api.cohere.com/v2/rerank";
@@ -147,11 +157,14 @@ export async function rerankChunks(
     }
     // A response that mapped to nothing usable is as good as a failure — keep the
     // fused order rather than return an empty (or partial-garbage) result.
-    return reordered.length > 0 ? reordered.slice(0, n) : chunks.slice(0, n);
+    if (reordered.length > 0) return reordered.slice(0, n);
+    deps.onFallback?.();
+    return chunks.slice(0, n);
   } catch (err) {
     console.warn(
       `[rerank] falling back to fused-hybrid order: ${(err as Error).message}`,
     );
+    deps.onFallback?.();
     return chunks.slice(0, n);
   }
 }
