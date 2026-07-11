@@ -1,61 +1,35 @@
 # ClearClass — Evaluation Report (U10)
 
-> **⏳ Not yet generated on live infrastructure.** This file is the committed
-> placeholder for the artifact `npm run eval` produces. The U10 harness and its
-> unit tests are complete and green; the live run is a deliberate, budgeted step
-> (it spends LLM/rerank/Tavily credits and needs the Insforge DB awake), so it is
-> triggered explicitly rather than on every build. Running the command below
-> **overwrites this file** with the real baseline-vs-advanced results.
+Generated 2026-07-11T15:46:59.111Z over the 200-row flexifyai test split. Each suite is run in both retrieval modes — `dense` (the U5 baseline) and `hybrid+rerank` (the U9 advanced arm) — against identical inputs, so the delta columns isolate the Task-6 retrieval change.
 
-## How to generate
+## AE4 — leakage guard
 
-```bash
-# Full report — both retrieval modes, all three suites (the submission artifact):
-npm run eval -- --e2e-limit=200 --rag-limit=40
+✅ **Clean.** 300 retrievable ruling(s) checked; none describe the same product as a test-split row above the 0.5 similarity threshold. No test answer is readable back from the corpus.
 
-# Cheap Task-6 headline only (recall@k, no LLM, no rerank spend beyond retrieval):
-npm run eval -- --recall-only
+## 1. Retrieval recall@k — the primary Task-6 signal
 
-# Sampled default (fast sanity pass): recall over all 200, e2e on 25, RAG on 10:
-npm run eval
-```
+Fraction of test rows whose gold HTS code was surfaced in the top-k retrieved chunks, with NO agent and NO LLM synthesis. This isolates the retrieval change: a real gain here is the cleanest before/after evidence, because the LLM step downstream can mask it.
 
-Flags: `--modes=dense|hybrid+rerank` (default both), `--limit=<n>` (cap all
-suites), `--e2e-limit=<n>` / `--rag-limit=<n>` (cap the expensive suites),
-`--k=5,10,20`, `--skip-e2e`, `--skip-rag`, `--out=<path>`. Requires the same
-credentials as `npm run eval:recall` (Insforge admin config + the LLM gateway
-key); `hybrid+rerank` additionally uses `COHERE_API_KEY` (it degrades to
-fused-hybrid order without one).
+| metric | dense (baseline) | hybrid+rerank (advanced) | Δ |
+| --- | --- | --- | --- |
+| recall@5 (≥6-digit) | 34.5% | 39.5% | +5.0 pts |
+| recall@10 (≥6-digit) | 42.5% | 48.5% | +6.0 pts |
+| recall@20 (≥6-digit) | 50.0% | 52.0% | +2.0 pts |
+| recall@5 (≥10-digit) | 20.5% | 26.0% | +5.5 pts |
+| recall@10 (≥10-digit) | 29.5% | 37.0% | +7.5 pts |
+| recall@20 (≥10-digit) | 38.0% | 41.0% | +3.0 pts |
 
-## What the generated report contains
+**Headline:** hybrid+rerank moves recall@10 at ≥10-digit by +7.5 pts over the dense baseline (the largest of 6 recall@k cells — read the full table above, not this cell alone).
 
-Each suite runs in **both** retrieval modes against identical inputs — `dense`
-(the U5 baseline) and `hybrid+rerank` (the U9 advanced arm) — so the Δ columns
-isolate the Task-6 retrieval change. Section order encodes the U10 Execution
-note: lead with recall@k, not end-to-end accuracy.
+## 2. End-to-end classification accuracy
 
-- **AE4 — leakage guard.** Runs *first* and aborts the whole run on any
-  violation: it re-applies the U3 ingest-time product-similarity guard against
-  the rulings actually retrievable from the corpus, proving no test answer can be
-  read back. A failed guard invalidates every number below it.
+Deterministic exact-match scoring of the full agent loop (retrieve → reason → rank). `top-1 exact` is the best-ranked candidate; `top-3 recall` is any of the three ranked candidates. A row the agent declines (no defensible corpus-backed code) is scored as a MISS, not excluded.
 
-- **1. Retrieval recall@k — the primary Task-6 signal.** Fraction of test rows
-  whose gold HTS code was surfaced in the top-k retrieved chunks, with no agent
-  and no LLM synthesis, at ≥6- and ≥10-digit precision. This is the cleanest
-  before/after evidence because it isolates retrieval from the LLM step (which
-  can mask a real retrieval gain in the final code). The baseline this must beat
-  is the U5 dense recall (6-digit r@20 ≈ 0.50, 10-digit r@20 ≈ 0.38).
+_End-to-end suite not run in this pass._
 
-- **2. End-to-end classification accuracy.** Deterministic exact-match scoring of
-  the full agent loop — top-1 exact and top-3 recall at 10-, 6-, and 4-digit
-  precision (R12). Reported with an n-scaled 95% confidence caveat (at n=200,
-  ≈±7%): a small end-to-end delta may be within noise even when recall@k clearly
-  improves, which is why the Task-6 claim leads with recall@k.
+## 3. RAG quality metrics (autoevals, LLM-judged)
 
-- **3. RAG quality metrics.** Braintrust `autoevals` RAGAS-ported LLM-as-judge
-  scorers (Faithfulness, AnswerRelevancy, Context precision/recall) on a ~40-row
-  subset — kept small and separate because they are slower and noisier than the
-  deterministic suites.
+Braintrust `autoevals` RAGAS-ported scorers on a 10-row subset (LLM-judged, so slower and noisier than the deterministic suites above — kept small and separate by design; each metric averages only its non-null judgments).
 
-After the run confirms the lift, flip production to the advanced arm with
-`RETRIEVAL_MODE=hybrid+rerank` (defaults to `dense` until then).
+_RAG-metrics suite not run in this pass._
+
