@@ -41,6 +41,7 @@ import {
 } from "ai";
 
 import { chatModel } from "@/lib/llm";
+import { telemetrySettings, type TelemetryMetadata } from "@/lib/observability";
 import type { RetrieveResult } from "@/lib/tools/retrieve";
 import type { TavilyToolResult } from "@/lib/tools/tavily";
 import {
@@ -674,8 +675,16 @@ export const GENERATE_TIMEOUT_MS = 30_000;
  *  Exported so the U10 eval harness can drive the REAL model loop through
  *  `runClassification` directly — measuring the shipping classification path
  *  without the per-importer memory side-effects `createRunAgent` layers on
- *  (an eval must not write precedent rows into the live `classifications` table). */
-export async function defaultGenerate(args: GenerateArgs): Promise<GenerateResult> {
+ *  (an eval must not write precedent rows into the live `classifications` table).
+ *
+ *  `telemetry` (Task 7 #3) carries the server-derived tenant onto the Langfuse
+ *  trace. It is optional so the eval path and tests call `defaultGenerate(args)`
+ *  unchanged; when Langfuse is unconfigured, `telemetrySettings` returns undefined
+ *  and `generateText` emits no spans. */
+export async function defaultGenerate(
+  args: GenerateArgs,
+  telemetry: TelemetryMetadata = {},
+): Promise<GenerateResult> {
   const result = await generateText({
     model: chatModel(),
     system: args.system,
@@ -684,6 +693,10 @@ export async function defaultGenerate(args: GenerateArgs): Promise<GenerateResul
     stopWhen: stepCountIs(args.maxSteps),
     experimental_output: Output.object({ schema: classificationSchema }),
     abortSignal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
+    experimental_telemetry: telemetrySettings({
+      functionId: "clearclass-classify",
+      metadata: telemetry,
+    }),
   });
   return { output: result.experimental_output, steps: result.steps };
 }
