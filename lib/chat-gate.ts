@@ -19,7 +19,7 @@ import {
   type ResolveTenantResult,
   type TenantContext,
 } from "@/lib/auth";
-import { createRunAgent } from "@/lib/agent";
+import { createRunAgent } from "@/lib/run-agent";
 
 /** The billable agent loop U6 will implement, behind the gate this unit establishes. */
 export type RunAgent = (input: {

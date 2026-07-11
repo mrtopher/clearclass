@@ -4,7 +4,6 @@ import {
   buildSystemPrompt,
   collectRetrievedChunkIds,
   collectWebUrls,
-  createRunAgent,
   deriveSourcesUsed,
   latestUserText,
   normalizeMessages,
@@ -17,6 +16,7 @@ import {
   type RetrievedIndex,
   type StepLike,
 } from "@/lib/agent";
+import { createRunAgent } from "@/lib/run-agent";
 import type { MemoryDeps } from "@/lib/memory";
 import type { Candidate, Citation, Classification } from "@/lib/schema";
 import type { TenantContext } from "@/lib/auth";
