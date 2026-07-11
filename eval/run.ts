@@ -46,13 +46,13 @@ import {
 
 import { withRetry } from "@/lib/corpus-io";
 import { resolveAdminConfig } from "@/lib/insforge-admin";
-import { DEFAULT_EMBEDDING_MODEL, DEFAULT_MODEL } from "@/lib/llm";
+import { DEFAULT_MODEL, embedTexts } from "@/lib/llm";
 import {
   createConfiguredRetriever,
   RETRIEVAL_MODES,
   type RetrievalMode,
 } from "@/lib/retrieval";
-import { DEFAULT_K, type DenseRetriever } from "@/lib/retrieval/dense";
+import { DEFAULT_K } from "@/lib/retrieval/dense";
 import {
   defaultGenerate,
   IndefensibleClassificationError,
@@ -159,17 +159,31 @@ async function runPool(
  * per-row failure is caught, counted, and skipped — one flaky request must not
  * sink the arm's baseline. Mirrors `retrieval-recall.ts#scoreRows`, generalized
  * off the embedding assumption and run with bounded concurrency.
+ *
+ * The retriever is built HERE (not passed in) so the advanced arm's rerank-health
+ * sink can be wired to a per-run counter: `rerankFallbacks` is how many rows saw
+ * the Cohere rerank degrade to fused-hybrid order (rate-limit/outage/missing key).
+ * It stays 0 for the dense arm (no rerank), and threads up into the `RecallSuite`
+ * so `renderReport` can flag a degraded run instead of silently labelling
+ * fused-hybrid numbers as "reranked". The shared counter is safe across the
+ * concurrent rows — the event loop is single-threaded, so `n++` never races.
  */
 async function scoreRetrieval(
   rows: readonly TestRow[],
-  retriever: DenseRetriever,
+  mode: RetrievalMode,
   maxK: number,
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
-): Promise<LoopOutcome<RowResult>> {
+): Promise<LoopOutcome<RowResult> & { rerankFallbacks: number }> {
   const scored: RowResult[] = [];
   let errors = 0;
   let done = 0;
+  let rerankFallbacks = 0;
+  const retriever = createConfiguredRetriever(mode, {
+    onRerankFallback: () => {
+      rerankFallbacks++;
+    },
+  });
   await runPool(rows.length, concurrency, async (i) => {
     try {
       const chunks = await withRetry(
@@ -183,7 +197,7 @@ async function scoreRetrieval(
     }
     onProgress?.(++done, rows.length);
   });
-  return { scored, errors };
+  return { scored, errors, rerankFallbacks };
 }
 
 // ── Suite 2: end-to-end classification accuracy ────────────────────────────────
@@ -236,10 +250,13 @@ async function scoreEndToEnd(
 
 // ── Suite 3: RAG quality metrics (LLM-judged, subset) ──────────────────────────
 
-/** The judge gateway config — the same OpenAI-compatible endpoint the app uses. */
+/**
+ * The judge gateway config — the same OpenAI-compatible endpoint the app uses.
+ * No `embeddingModel`: the only embedding step (AnswerRelevancy's question↔input
+ * cosine) goes through `embedTexts`, which already uses the app's default model.
+ */
 interface JudgeConfig {
   model: string;
-  embeddingModel: string;
   openAiApiKey: string;
   openAiBaseUrl: string;
 }
@@ -254,7 +271,6 @@ function resolveJudgeConfig(): JudgeConfig {
   }
   return {
     model: DEFAULT_MODEL,
-    embeddingModel: DEFAULT_EMBEDDING_MODEL,
     openAiApiKey,
     openAiBaseUrl: process.env.LLM_BASE_URL ?? "https://openrouter.ai/api/v1",
   };
@@ -284,6 +300,68 @@ async function judge(
   }
 }
 
+/** Cosine similarity of two equal-length embedding vectors; 0 for a zero vector. */
+function cosine(a: readonly number[], b: readonly number[]): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+/**
+ * AnswerRelevancy, but with the score computed correctly for THIS gateway.
+ *
+ * autoevals' `AnswerRelevancy` generates N questions from the answer and scores
+ * how close they are to the real query — but it routes the closeness through
+ * `EmbeddingSimilarity`, which rescales cosine by a hardcoded 0.7 floor
+ * (`(cos − 0.7) / 0.3`, clamped to [0,1]) and gives `AnswerRelevancy` no way to
+ * override it. A generated question ("What is the HTS code for …?") vs. a terse
+ * product description sits around ~0.48 cosine here — genuinely relevant, but
+ * below 0.7 → clamped to 0 on every row (both modes reported 0.0%). RAGAS itself
+ * averages the RAW cosine, no floor. Embeddings route through the gateway fine
+ * (verified); the floor is the whole defect.
+ *
+ * So we keep autoevals' question generation + noncommittal detection (its
+ * `metadata.questions`) and recompute the score ourselves: mean raw cosine
+ * between each generated question and the input, via the same proven gateway
+ * embedder the retriever uses (`embedTexts`). A noncommittal answer still scores
+ * 0 (RAGAS semantics). If question generation yields nothing (e.g. an autoevals
+ * shape change), we return null so the report renders "—" rather than a fake 0.
+ */
+async function answerRelevancy(args: {
+  input: string;
+  output: string;
+  context: string[];
+  model: string;
+  openAiApiKey: string;
+  openAiBaseUrl: string;
+}): Promise<{ score: number | null }> {
+  const res = (await AnswerRelevancy({
+    input: args.input,
+    output: args.output,
+    context: args.context,
+    model: args.model,
+    openAiApiKey: args.openAiApiKey,
+    openAiBaseUrl: args.openAiBaseUrl,
+  })) as { metadata?: { questions?: { question: string; noncommittal?: unknown }[] } };
+
+  const questions = res.metadata?.questions ?? [];
+  if (questions.length === 0) return { score: null };
+  // RAGAS: an evasive/hedged ("noncommittal") answer scores 0 outright.
+  if (questions.some((q) => q.noncommittal)) return { score: 0 };
+
+  const [inputVec] = await embedTexts([args.input]);
+  const questionVecs = await embedTexts(questions.map((q) => q.question));
+  const sims = questionVecs.map((v) => Math.max(0, cosine(v, inputVec)));
+  return { score: sims.reduce((a, b) => a + b, 0) / sims.length };
+}
+
 /** Judge one row: retrieve its context, run the agent, score the four RAG metrics. */
 async function scoreRagRow(
   row: TestRow,
@@ -301,9 +379,7 @@ async function scoreRagRow(
 
   return Promise.all([
     judge("Faithfulness", () => Faithfulness({ input: query, output, context, ...auth })),
-    judge("AnswerRelevancy", () =>
-      AnswerRelevancy({ input: query, output, context, embeddingModel: cfg.embeddingModel, ...auth }),
-    ),
+    judge("AnswerRelevancy", () => answerRelevancy({ input: query, output, context, ...auth })),
     judge("ContextPrecision", () => ContextPrecision({ input: query, output, context, expected, ...auth })),
     judge("ContextRecall", () => ContextRecall({ input: query, output, context, expected, ...auth })),
   ]);
@@ -512,19 +588,14 @@ async function main(): Promise<void> {
 
     // Suite 1: recall@k (all rows).
     console.log(`[eval] recall@k over ${rows.length} rows (k=${args.ks.join(",")})...`);
-    const r = await scoreRetrieval(
-      rows,
-      createConfiguredRetriever(mode),
-      maxK,
-      args.concurrency,
-      progress("recall"),
-    );
+    const r = await scoreRetrieval(rows, mode, maxK, args.concurrency, progress("recall"));
     assertErrorRate(`recall[${mode}]`, r.errors, rows.length);
     recall.push({
       mode,
       results: summarizeRecall(r.scored, args.ks, DEFAULT_RECALL_DIGITS),
       scored: r.scored.length,
       errors: r.errors,
+      rerankFallbacks: r.rerankFallbacks,
     });
 
     if (args.recallOnly) continue;

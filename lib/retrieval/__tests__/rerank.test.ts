@@ -79,6 +79,35 @@ describe("rerankChunks", () => {
     expect(out.map((c) => c.id)).toEqual([1, 2]);
     expect(rerank).not.toHaveBeenCalled();
   });
+
+  it("fires onFallback exactly once when the reranker THROWS", async () => {
+    const onFallback = vi.fn();
+    const rerank: RerankFn = vi.fn(async () => {
+      throw new Error("Cohere 429");
+    });
+    await rerankChunks("q", fused, 3, { rerank, onFallback });
+    expect(onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires onFallback when the response maps to nothing usable", async () => {
+    const onFallback = vi.fn();
+    // Every returned index is out of range → no chunk maps → degrade to fused.
+    await rerankChunks("q", fused, 2, { rerank: rankTo([9, 10]), onFallback });
+    expect(onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT fire onFallback on a successful rerank", async () => {
+    const onFallback = vi.fn();
+    await rerankChunks("q", fused, 2, { rerank: rankTo([2, 0]), onFallback });
+    expect(onFallback).not.toHaveBeenCalled();
+  });
+
+  it("does NOT fire onFallback for the blank-query / empty-pool non-rerank paths", async () => {
+    const onFallback = vi.fn();
+    await rerankChunks("   ", fused, 2, { rerank: rankTo([3, 2]), onFallback }); // blank query
+    await rerankChunks("q", [], 2, { rerank: rankTo([]), onFallback }); // empty pool
+    expect(onFallback).not.toHaveBeenCalled();
+  });
 });
 
 describe("createCohereRerank", () => {

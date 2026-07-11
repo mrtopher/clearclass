@@ -239,6 +239,35 @@ describe("renderReport", () => {
     expect(md).not.toMatch(/RAG-metrics suite not run/);
   });
 
+  it("flags a degraded advanced arm when a meaningful fraction of reranks fell back", () => {
+    const data = baseReport();
+    data.recall[1].rerankFallbacks = 180; // advanced arm scored 200 → 90% fell back
+    const md = renderReport(data);
+    expect(md).toMatch(/⚠️ \*\*Advanced arm degraded/);
+    expect(md).toMatch(/did not run on 180\/200 rows/);
+    expect(md).toMatch(/\*\*fused-hybrid, not reranked\*\*/);
+    // The caveat must precede the headline lift claim it qualifies.
+    expect(md.indexOf("Advanced arm degraded")).toBeLessThan(md.indexOf("**Headline:**"));
+  });
+
+  it("stays quiet when the reranker ran cleanly (no fallbacks)", () => {
+    const data = baseReport();
+    data.recall[1].rerankFallbacks = 0;
+    expect(renderReport(data)).not.toMatch(/Advanced arm degraded/);
+  });
+
+  it("stays quiet for a negligible fallback fraction below the warn threshold", () => {
+    const data = baseReport();
+    data.recall[1].rerankFallbacks = 5; // 5/200 = 2.5% < 10% threshold
+    expect(renderReport(data)).not.toMatch(/Advanced arm degraded/);
+  });
+
+  it("does not warn when rerank health was never recorded (field absent)", () => {
+    // baseReport()'s recall suites carry no rerankFallbacks — the common path
+    // (e.g. dense-only, or a run predating the counter) must not falsely warn.
+    expect(renderReport(baseReport())).not.toMatch(/Advanced arm degraded/);
+  });
+
   it("surfaces asymmetric per-mode scored counts instead of a single nominal size", () => {
     const md = renderReport(
       baseReport({

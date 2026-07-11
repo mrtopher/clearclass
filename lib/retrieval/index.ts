@@ -65,6 +65,13 @@ export interface AdvancedRetrieverDeps {
   rerank?: RerankFn;
   /** Candidates pulled from each arm before fusion; defaults to CANDIDATE_POOL. */
   candidatePool?: number;
+  /**
+   * Optional health sink, forwarded to `rerankChunks`: fired once per query when
+   * the rerank degrades to fused-hybrid order (Cohere outage/timeout/missing key).
+   * The eval harness wires this to a per-run counter so a degraded advanced arm is
+   * flagged in the report rather than silently reported as reranked retrieval.
+   */
+  onRerankFallback?: () => void;
 }
 
 /**
@@ -82,7 +89,7 @@ export function createAdvancedRetriever(deps: AdvancedRetrieverDeps = {}): Dense
   return async (query, opts = {}) => {
     const fused = await hybrid(query, { candidatePool, type: opts.type });
     const finalK = clampK(opts.k ?? DEFAULT_K);
-    return rerankChunks(query, fused, finalK, { rerank });
+    return rerankChunks(query, fused, finalK, { rerank, onFallback: deps.onRerankFallback });
   };
 }
 
@@ -93,6 +100,9 @@ export function createAdvancedRetriever(deps: AdvancedRetrieverDeps = {}): Dense
  */
 export function createConfiguredRetriever(
   mode: RetrievalMode = resolveRetrievalMode(),
+  deps: AdvancedRetrieverDeps = {},
 ): DenseRetriever {
-  return mode === "hybrid+rerank" ? createAdvancedRetriever() : createDenseRetriever();
+  // `deps` (incl. the rerank-health sink) only applies to the advanced arm; the
+  // dense baseline never reranks, so it has nothing to fall back FROM.
+  return mode === "hybrid+rerank" ? createAdvancedRetriever(deps) : createDenseRetriever();
 }
