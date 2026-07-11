@@ -109,6 +109,15 @@ const DEFAULT_OUT = "eval/report.md";
  * 0.1 gate for the deterministic suites, is imported from the recall harness.)
  */
 const RAG_MAX_ERROR_RATE = 0.5;
+/**
+ * Rows scored in parallel per suite. The run is latency-bound (each row is a
+ * sequence of network round-trips), so overlapping rows cuts wall-clock ~Nx at
+ * the SAME token cost. Kept modest by default: the e2e agent loop fans out to
+ * several model+tool calls per row, so 6 concurrent rows is already a healthy
+ * burst against the gateway / rerank / DB without tripping rate limits. Raise it
+ * (`--concurrency`) on generous quotas; lower it to 1 for a strictly serial run.
+ */
+const DEFAULT_CONCURRENCY = 6;
 
 // ── Suite 1: retrieval recall@k (mode-agnostic — works for dense AND hybrid) ────
 
@@ -119,22 +128,49 @@ interface LoopOutcome<T> {
 }
 
 /**
+ * Run `task(i)` for every index in [0, total) with at most `concurrency` tasks
+ * in flight, so a suite's independent per-row network work OVERLAPS instead of
+ * running strictly serially. The rows never interact (each scores one query), so
+ * this is pure wall-clock savings at the SAME token cost — the whole run is
+ * latency-bound, not compute-bound. Each task owns its own try/catch, so one
+ * failure never rejects the pool. Order-independent: callers aggregate the whole
+ * result set (`summarizeRecall`/`summarizeAccuracy`/`averageRagScores`), so the
+ * completion order of a concurrent run does not change any reported number.
+ */
+async function runPool(
+  total: number,
+  concurrency: number,
+  task: (i: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < total; i = next++) {
+      await task(i);
+    }
+  };
+  const workers = Math.min(Math.max(1, concurrency), Math.max(1, total));
+  await Promise.all(Array.from({ length: workers }, worker));
+}
+
+/**
  * Score retrieval recall for one mode by calling its retriever with the query
  * STRING (not a pre-computed embedding), so the same loop drives both the dense
  * arm and the hybrid+rerank arm (which embeds + does lexical internally). A
  * per-row failure is caught, counted, and skipped — one flaky request must not
  * sink the arm's baseline. Mirrors `retrieval-recall.ts#scoreRows`, generalized
- * off the embedding assumption.
+ * off the embedding assumption and run with bounded concurrency.
  */
 async function scoreRetrieval(
   rows: readonly TestRow[],
   retriever: DenseRetriever,
   maxK: number,
+  concurrency: number,
   onProgress?: (done: number, total: number) => void,
 ): Promise<LoopOutcome<RowResult>> {
   const scored: RowResult[] = [];
   let errors = 0;
-  for (let i = 0; i < rows.length; i++) {
+  let done = 0;
+  await runPool(rows.length, concurrency, async (i) => {
     try {
       const chunks = await withRetry(
         () => retriever(cleanQuery(rows[i].description), { k: maxK }),
@@ -145,8 +181,8 @@ async function scoreRetrieval(
       errors++;
       console.warn(`[eval] recall row ${i + 1} failed: ${(err as Error).message} — skipping.`);
     }
-    onProgress?.(i + 1, rows.length);
-  }
+    onProgress?.(++done, rows.length);
+  });
   return { scored, errors };
 }
 
@@ -171,12 +207,14 @@ function classificationDepsFor(mode: RetrievalMode): ClassificationDeps {
 async function scoreEndToEnd(
   rows: readonly TestRow[],
   mode: RetrievalMode,
+  concurrency: number,
   onProgress?: (done: number, total: number) => void,
 ): Promise<LoopOutcome<ReturnType<typeof toOutcome>>> {
   const deps = classificationDepsFor(mode);
   const scored: ReturnType<typeof toOutcome>[] = [];
   let errors = 0;
-  for (let i = 0; i < rows.length; i++) {
+  let done = 0;
+  await runPool(rows.length, concurrency, async (i) => {
     try {
       const result = await runClassification({ messages: cleanQuery(rows[i].description) }, deps);
       scored.push(toOutcome(result, rows[i].gold_hts));
@@ -191,8 +229,8 @@ async function scoreEndToEnd(
         console.warn(`[eval] e2e[${mode}] row ${i + 1} failed: ${(err as Error).message} — skipping.`);
       }
     }
-    onProgress?.(i + 1, rows.length);
-  }
+    onProgress?.(++done, rows.length);
+  });
   return { scored, errors };
 }
 
@@ -289,19 +327,21 @@ async function scoreRag(
   rows: readonly TestRow[],
   mode: RetrievalMode,
   cfg: JudgeConfig,
+  concurrency: number,
   onProgress?: (done: number, total: number) => void,
 ): Promise<{ scores: RagScore[]; scored: number; errors: number }> {
   const perRow: RagScore[][] = [];
   let errors = 0;
-  for (let i = 0; i < rows.length; i++) {
+  let done = 0;
+  await runPool(rows.length, concurrency, async (i) => {
     try {
       perRow.push(await scoreRagRow(rows[i], mode, cfg));
     } catch (err) {
       errors++;
       console.warn(`[eval] RAG[${mode}] row ${i + 1} failed: ${(err as Error).message} — skipping.`);
     }
-    onProgress?.(i + 1, rows.length);
-  }
+    onProgress?.(++done, rows.length);
+  });
   // Don't abort the whole run on RAG flakiness (unlike the strict deterministic
   // gate) — warn loudly instead. The report surfaces the actual per-mode `scored`
   // count so an average resting on only a few judgments is visible, not hidden.
@@ -326,6 +366,7 @@ interface EvalArgs {
   recallOnly: boolean;
   skipE2e: boolean;
   skipRag: boolean;
+  concurrency: number;
   out: string;
 }
 
@@ -358,6 +399,7 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
     recallOnly: false,
     skipE2e: false,
     skipRag: false,
+    concurrency: DEFAULT_CONCURRENCY,
     out: DEFAULT_OUT,
   };
   for (const arg of argv) {
@@ -394,13 +436,16 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
       case "skip-rag":
         args.skipRag = true;
         break;
+      case "concurrency":
+        args.concurrency = parsePositiveInt(value, "--concurrency");
+        break;
       case "out":
         if (value) args.out = value;
         break;
       default:
         throw new Error(
           `Unrecognized argument: ${JSON.stringify(arg)}. Supported: --split --limit ` +
-            "--e2e-limit --rag-limit --k --modes --recall-only --skip-e2e --skip-rag --out",
+            "--e2e-limit --rag-limit --k --modes --recall-only --skip-e2e --skip-rag --concurrency --out",
         );
     }
   }
@@ -460,12 +505,20 @@ async function main(): Promise<void> {
   const ragRows = args.ragLimit ? rows.slice(0, args.ragLimit) : rows;
   const judgeCfg = !args.recallOnly && !args.skipRag ? resolveJudgeConfig() : null;
 
+  console.log(`[eval] Scoring ${args.concurrency} rows in parallel per suite.`);
+
   for (const mode of args.modes) {
     console.log(`\n[eval] === mode: ${mode} ===`);
 
     // Suite 1: recall@k (all rows).
     console.log(`[eval] recall@k over ${rows.length} rows (k=${args.ks.join(",")})...`);
-    const r = await scoreRetrieval(rows, createConfiguredRetriever(mode), maxK, progress("recall"));
+    const r = await scoreRetrieval(
+      rows,
+      createConfiguredRetriever(mode),
+      maxK,
+      args.concurrency,
+      progress("recall"),
+    );
     assertErrorRate(`recall[${mode}]`, r.errors, rows.length);
     recall.push({
       mode,
@@ -479,7 +532,7 @@ async function main(): Promise<void> {
     // Suite 2: end-to-end accuracy (sampled).
     if (!args.skipE2e) {
       console.log(`[eval] end-to-end accuracy over ${e2eRows.length} rows (full agent loop)...`);
-      const e = await scoreEndToEnd(e2eRows, mode, progress("e2e"));
+      const e = await scoreEndToEnd(e2eRows, mode, args.concurrency, progress("e2e"));
       assertErrorRate(`e2e[${mode}]`, e.errors, e2eRows.length);
       accuracy.push({
         mode,
@@ -492,7 +545,7 @@ async function main(): Promise<void> {
     // Suite 3: RAG metrics (sampled, LLM-judged).
     if (!args.skipRag && judgeCfg) {
       console.log(`[eval] RAG metrics over ${ragRows.length} rows (LLM-judged)...`);
-      const g = await scoreRag(ragRows, mode, judgeCfg, progress("rag"));
+      const g = await scoreRag(ragRows, mode, judgeCfg, args.concurrency, progress("rag"));
       rag.push({ mode, scores: g.scores, scored: g.scored });
     }
   }

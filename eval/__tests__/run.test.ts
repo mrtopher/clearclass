@@ -16,7 +16,13 @@ describe("parseArgs", () => {
     expect(args.e2eLimit).toBe(25);
     expect(args.ragLimit).toBe(10);
     expect(args.recallOnly).toBe(false);
+    expect(args.concurrency).toBe(6);
     expect(args.out).toBe("eval/report.md");
+  });
+
+  it("parses --concurrency and rejects a non-positive value", () => {
+    expect(parseArgs(["--concurrency=12"]).concurrency).toBe(12);
+    expect(() => parseArgs(["--concurrency=0"])).toThrow(/positive integer/);
   });
 
   it("parses --recall-only and a single --modes value", () => {
