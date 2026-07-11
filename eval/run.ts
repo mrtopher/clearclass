@@ -32,6 +32,10 @@
  *   npx tsx eval/run.ts --recall-only             # just the cheap Task-6 headline signal
  *   npx tsx eval/run.ts --e2e-limit=200 --rag-limit=40   # the full budgeted run
  *   npx tsx eval/run.ts --modes=dense             # a single arm
+ *   npx tsx eval/run.ts --modes=hybrid+rerank --e2e-limit=200 --skip-rag [--reselect]
+ *                                                 # the Task-6.3 agent A/B: run once
+ *                                                 # without and once WITH --reselect,
+ *                                                 # retrieval mode held fixed.
  */
 import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -56,6 +60,7 @@ import { DEFAULT_K } from "@/lib/retrieval/dense";
 import {
   defaultGenerate,
   IndefensibleClassificationError,
+  resolveReselect,
   RETRIEVE_TOOL,
   runClassification,
   WEB_SEARCH_TOOL,
@@ -204,14 +209,17 @@ async function scoreRetrieval(
 
 /** Build the agent deps for a mode: the retrieve tool bound to that mode's
  *  retriever, plus the real web-search tool and the real (buffered) model loop.
- *  No memory layer — the eval must not persist precedent into the live table. */
-function classificationDepsFor(mode: RetrievalMode): ClassificationDeps {
+ *  No memory layer — the eval must not persist precedent into the live table.
+ *  `reselect` toggles the Task-6.3 agent-side lever so the harness can A/B it with
+ *  RETRIEVAL_MODE held fixed (isolating the agent change from the retriever). */
+function classificationDepsFor(mode: RetrievalMode, reselect: boolean): ClassificationDeps {
   return {
     tools: {
       [RETRIEVE_TOOL]: createRetrieveTool(createConfiguredRetriever(mode)),
       [WEB_SEARCH_TOOL]: createTavilyTool(),
     },
     generate: defaultGenerate,
+    reselect,
   };
 }
 
@@ -221,10 +229,11 @@ function classificationDepsFor(mode: RetrievalMode): ClassificationDeps {
 async function scoreEndToEnd(
   rows: readonly TestRow[],
   mode: RetrievalMode,
+  reselect: boolean,
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
 ): Promise<LoopOutcome<ReturnType<typeof toOutcome>>> {
-  const deps = classificationDepsFor(mode);
+  const deps = classificationDepsFor(mode, reselect);
   const scored: ReturnType<typeof toOutcome>[] = [];
   let errors = 0;
   let done = 0;
@@ -366,6 +375,7 @@ async function answerRelevancy(args: {
 async function scoreRagRow(
   row: TestRow,
   mode: RetrievalMode,
+  reselect: boolean,
   cfg: JudgeConfig,
 ): Promise<RagScore[]> {
   const query = cleanQuery(row.description);
@@ -373,7 +383,7 @@ async function scoreRagRow(
   const retriever = createConfiguredRetriever(mode);
   const chunks = await retriever(query, { k: RAG_CONTEXT_K });
   const context = chunks.map((c) => c.content);
-  const result = await runClassification({ messages: query }, classificationDepsFor(mode));
+  const result = await runClassification({ messages: query }, classificationDepsFor(mode, reselect));
   const output = answerText(result);
   const expected = row.reasoning;
 
@@ -402,6 +412,7 @@ function averageRagScores(perRow: readonly RagScore[][]): RagScore[] {
 async function scoreRag(
   rows: readonly TestRow[],
   mode: RetrievalMode,
+  reselect: boolean,
   cfg: JudgeConfig,
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
@@ -411,7 +422,7 @@ async function scoreRag(
   let done = 0;
   await runPool(rows.length, concurrency, async (i) => {
     try {
-      perRow.push(await scoreRagRow(rows[i], mode, cfg));
+      perRow.push(await scoreRagRow(rows[i], mode, reselect, cfg));
     } catch (err) {
       errors++;
       console.warn(`[eval] RAG[${mode}] row ${i + 1} failed: ${(err as Error).message} — skipping.`);
@@ -439,6 +450,10 @@ interface EvalArgs {
   ragLimit: number | null;
   ks: number[];
   modes: RetrievalMode[];
+  /** Task-6.3 agent-side lever: re-rank the model's own candidates by retrieval
+   *  support (`--reselect` / `--reselect=off`). Held identical across both retrieval
+   *  modes so a run isolates the agent change from the retriever. */
+  reselect: boolean;
   recallOnly: boolean;
   skipE2e: boolean;
   skipRag: boolean;
@@ -472,6 +487,7 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
     ragLimit: DEFAULT_RAG_LIMIT,
     ks: DEFAULT_KS,
     modes: [...RETRIEVAL_MODES],
+    reselect: false,
     recallOnly: false,
     skipE2e: false,
     skipRag: false,
@@ -503,6 +519,12 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
         if (!value) throw new Error("--modes requires a value, e.g. --modes=dense,hybrid+rerank");
         args.modes = parseModes(value);
         break;
+      case "reselect":
+        // Bare `--reselect` turns it ON; `--reselect=off|on|true|false` is explicit.
+        // resolveReselect only reads env when the value is undefined, so a defined
+        // value (even "off") is honoured verbatim here.
+        args.reselect = value == null ? true : resolveReselect(value);
+        break;
       case "recall-only":
         args.recallOnly = true;
         break;
@@ -521,7 +543,7 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
       default:
         throw new Error(
           `Unrecognized argument: ${JSON.stringify(arg)}. Supported: --split --limit ` +
-            "--e2e-limit --rag-limit --k --modes --recall-only --skip-e2e --skip-rag --concurrency --out",
+            "--e2e-limit --rag-limit --k --modes --reselect --recall-only --skip-e2e --skip-rag --concurrency --out",
         );
     }
   }
@@ -551,6 +573,7 @@ async function main(): Promise<void> {
   const rows = await loadTestRows(args.split, args.limit);
   console.log(
     `[eval] Loaded ${rows.length} test rows. Modes: ${args.modes.join(", ")}. ` +
+      `Agent re-selection: ${args.reselect ? "ON" : "off"}. ` +
       `Suites: recall${args.recallOnly ? " only" : ", e2e, rag"}.`,
   );
 
@@ -603,7 +626,7 @@ async function main(): Promise<void> {
     // Suite 2: end-to-end accuracy (sampled).
     if (!args.skipE2e) {
       console.log(`[eval] end-to-end accuracy over ${e2eRows.length} rows (full agent loop)...`);
-      const e = await scoreEndToEnd(e2eRows, mode, args.concurrency, progress("e2e"));
+      const e = await scoreEndToEnd(e2eRows, mode, args.reselect, args.concurrency, progress("e2e"));
       assertErrorRate(`e2e[${mode}]`, e.errors, e2eRows.length);
       accuracy.push({
         mode,
@@ -616,7 +639,7 @@ async function main(): Promise<void> {
     // Suite 3: RAG metrics (sampled, LLM-judged).
     if (!args.skipRag && judgeCfg) {
       console.log(`[eval] RAG metrics over ${ragRows.length} rows (LLM-judged)...`);
-      const g = await scoreRag(ragRows, mode, judgeCfg, args.concurrency, progress("rag"));
+      const g = await scoreRag(ragRows, mode, args.reselect, judgeCfg, args.concurrency, progress("rag"));
       rag.push({ mode, scores: g.scores, scored: g.scored });
     }
   }
@@ -642,6 +665,7 @@ async function main(): Promise<void> {
     ks: args.ks,
     recallDigits: DEFAULT_RECALL_DIGITS,
     accuracyDigits: accuracy.length ? [...ACCURACY_DIGITS] : [],
+    reselect: args.reselect,
     leakage,
     recall,
     accuracy,

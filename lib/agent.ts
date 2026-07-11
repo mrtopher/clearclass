@@ -49,7 +49,9 @@ import {
   type Citation,
   type Classification,
   type ClassificationResult,
+  type Recommendation,
   type SourcesUsed,
+  type WhyNot,
 } from "@/lib/schema";
 
 /** The two tools the agent loop drives. Names are stable — the derivation
@@ -84,11 +86,38 @@ function toolResultsNamed(steps: readonly StepLike[], name: string): unknown[] {
   );
 }
 
-/** The citation-relevant fields of a retrieved corpus chunk, keyed by its id. */
+/** The citation-relevant fields of a retrieved corpus chunk, keyed by its id.
+ *  `rank`/`similarity` are the retrieval-strength signals the re-selection lever
+ *  reads (`reselectByRetrievalSupport`); the code fields back citation validation. */
 export interface RetrievedChunkMeta {
   hts_code?: string;
   ruling_number?: string;
   gri_rule?: string;
+  /**
+   * Best (smallest) 0-based position this chunk reached in ANY retrieve call —
+   * 0 is the top of a ranked list. In `hybrid+rerank` mode this position is the
+   * Cohere cross-encoder's ordering (the reranker reorders chunks but leaves each
+   * chunk's `similarity` = its dense cosine, so position, not similarity, is what
+   * faithfully encodes the reranker's judgment — which is why the re-selection
+   * scores on rank). Absent only if no row carried it.
+   */
+  rank?: number;
+}
+
+/** Fold a newly-seen chunk position into its accumulated meta: keep the smaller
+ *  rank (closer to the top of some retrieve call's ranked list). */
+function mergeChunkMeta(
+  prev: RetrievedChunkMeta | undefined,
+  next: RetrievedChunkMeta,
+): RetrievedChunkMeta {
+  const minDefined = (a?: number, b?: number) =>
+    a == null ? b : b == null ? a : Math.min(a, b);
+  return {
+    hts_code: next.hts_code ?? prev?.hts_code,
+    ruling_number: next.ruling_number ?? prev?.ruling_number,
+    gri_rule: next.gri_rule ?? prev?.gri_rule,
+    rank: minDefined(prev?.rank, next.rank),
+  };
 }
 
 /**
@@ -97,6 +126,13 @@ export interface RetrievedChunkMeta {
  * enforces (KTD11): a corpus citation may reference an id ONLY if it appears
  * here, AND any code it claims must match the chunk's actual code — membership
  * alone doesn't stop the model from stapling a fabricated code onto a real id.
+ *
+ * Each chunk also carries its best `rank` across the run, the signal the (opt-in)
+ * re-selection lever ranks the agent's own candidates by. The position among the
+ * VALID rows of a retrieve result IS that call's rank (0 = top); a chunk seen at
+ * position 0 in one call and 3 in another keeps 0. Rank counts only rows that
+ * parse (a malformed/id-less row is skipped without shifting later ranks), so the
+ * "position IS the rank" premise doesn't depend on every row being well-formed.
  */
 export function collectRetrievedChunks(
   steps: readonly StepLike[],
@@ -105,14 +141,19 @@ export function collectRetrievedChunks(
   for (const output of toolResultsNamed(steps, RETRIEVE_TOOL)) {
     const rows = (output as RetrieveResult | undefined)?.chunks;
     if (!Array.isArray(rows)) continue;
+    let rank = 0; // position among valid rows in this retrieve call (0 = top)
     for (const c of rows) {
-      if (typeof c?.id === "number") {
-        chunks.set(c.id, {
+      if (typeof c?.id !== "number") continue;
+      chunks.set(
+        c.id,
+        mergeChunkMeta(chunks.get(c.id), {
           hts_code: c.hts_code,
           ruling_number: c.ruling_number,
           gri_rule: c.gri_rule,
-        });
-      }
+          rank,
+        }),
+      );
+      rank += 1;
     }
   }
   return chunks;
@@ -301,6 +342,134 @@ ${precedent}
 </precedent>`;
 }
 
+// ── Retrieval-support re-selection (the Task-6.3 agent-side lever) ─────────────
+
+/**
+ * Re-selection toggle. `off` (the default) keeps the model's own candidate order;
+ * `on` re-ranks the model's three candidates by an INDEPENDENT retrieval signal
+ * (`reselectByRetrievalSupport`). Resolved from `AGENT_RESELECT` so it flips A/B
+ * the way `RETRIEVAL_MODE` flips the retriever — the production route reads the
+ * env, the eval harness passes a CLI flag, and both share this one parser so a
+ * typo can't silently ship the wrong arm. Fail-safe: an unrecognized value warns
+ * and stays OFF (never silently changes the shipped ranking).
+ */
+export function resolveReselect(
+  raw: string | undefined = process.env.AGENT_RESELECT,
+): boolean {
+  const v = raw?.trim().toLowerCase();
+  if (!v || v === "off" || v === "false" || v === "0" || v === "baseline") return false;
+  if (v === "on" || v === "true" || v === "1" || v === "reselect" || v === "advanced") {
+    return true;
+  }
+  console.warn(`[agent] unrecognized AGENT_RESELECT=${JSON.stringify(raw)}; defaulting to "off"`);
+  return false;
+}
+
+/**
+ * A candidate's retrieval-support score: the BEST (smallest) rank position of any
+ * corpus chunk it cites that was actually retrieved. Smaller = the retriever (the
+ * Cohere reranker, in `hybrid+rerank` mode) placed this candidate's own supporting
+ * evidence higher. A candidate with no retrieved-and-cited corpus chunk scores
+ * `+Infinity` (no signal) — after citation validation every kept candidate has at
+ * least one, so this only bites on a degenerate/uncited candidate.
+ */
+export function candidateSupportRank(
+  candidate: Candidate,
+  chunks: Map<number, RetrievedChunkMeta>,
+): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (const c of candidate.citations) {
+    if (c.source !== "corpus" || c.chunk_id == null) continue;
+    const rank = chunks.get(c.chunk_id)?.rank;
+    if (rank != null && rank < best) best = rank;
+  }
+  return best;
+}
+
+/** The candidate/recommendation/why-not triple, decoupled from `sources_used`
+ *  (which is derived separately) so the re-selection is a pure permutation. */
+export type RankedClassification = Pick<
+  Classification,
+  "candidates" | "recommendation" | "why_not"
+>;
+
+/**
+ * Re-rank the model's OWN three candidates by retrieval support, then rebuild the
+ * recommendation + why-not so the whole output stays internally consistent with
+ * the new #1. This is the Task-6.3 lever: the eval localized the remaining loss to
+ * the agent's final PICK (retrieval reliably gets the right code into the top-3,
+ * but the model doesn't always rank it #1), so we let the reranker's ordering —
+ * an independent signal the model didn't fully use — choose among the candidates
+ * the model already deemed defensible.
+ *
+ * Properties that make the A/B clean:
+ *  - It is a PERMUTATION of the existing three candidates, so for a FIXED model
+ *    output the top-3 SET is unchanged and only top-1 can move (proven by unit
+ *    test). The harness measures this across two INDEPENDENT runs (OFF vs ON) with
+ *    no fixed seed, so empirically top-3 moves only within model-sampling noise
+ *    while top-1 carries the re-selection effect — read the residual top-3 drift as
+ *    the noise floor for the top-1 delta. (A future eval could score both orderings
+ *    off ONE generation for a seed-free, fully isolated paired A/B.)
+ *  - The sort is STABLE (ties, and the no-signal case, fall back to the model's
+ *    original best-first order — i.e. the model's own confidence ranking), so it
+ *    never reshuffles candidates retrieval has no opinion about.
+ *
+ * The rebuilt recommendation/why-not preserve POLARITY: a defense stays a defense,
+ * a rebuttal stays a rebuttal. The recommendation's `why` is the model's original
+ * defense when the #1 pick is unchanged, else the promoted candidate's own positive
+ * GRI reasoning; each why-not reuses the model's original rebuttal for that code
+ * when it had one, else that candidate's reasoning. A rejection rationale is NEVER
+ * reused as a recommendation's defense (which is what a naive by-code lookup would
+ * do the moment the lever actually changes the pick).
+ */
+export function reselectByRetrievalSupport(
+  classification: RankedClassification,
+  chunks: Map<number, RetrievedChunkMeta>,
+): RankedClassification {
+  const ranked = classification.candidates
+    .map((candidate, order) => ({
+      candidate,
+      order,
+      support: candidateSupportRank(candidate, chunks),
+    }))
+    .sort((a, b) => {
+      // `!==` guards the Infinity−Infinity = NaN trap: equal supports (incl. both
+      // +Infinity) skip straight to the stable order tiebreak.
+      if (a.support !== b.support) return a.support - b.support;
+      return a.order - b.order;
+    })
+    .map((x) => x.candidate);
+
+  // Keep the two text roles in SEPARATE maps: the model's recommendation.why is a
+  // defense (argues FOR a code); each why_not.why is a rebuttal (argues AGAINST a
+  // code). Merging them under one code key would, the moment re-selection promotes
+  // a former why-not candidate, ship that candidate's rejection text as its
+  // recommendation — a code-specific but polarity-inverted "defense".
+  const defenseByCode = new Map<string, string>([
+    [classification.recommendation.hts_code, classification.recommendation.why],
+  ]);
+  const rebuttalByCode = new Map<string, string>();
+  for (const wn of classification.why_not) {
+    if (!rebuttalByCode.has(wn.hts_code)) rebuttalByCode.set(wn.hts_code, wn.why);
+  }
+
+  const [top, ...rest] = ranked;
+  // Promoted #1's defense: the model's original recommendation.why iff the pick is
+  // unchanged, else the candidate's OWN positive GRI reasoning — never a why-not.
+  const recommendation: Recommendation = {
+    hts_code: top.hts_code,
+    why: defenseByCode.get(top.hts_code) ?? top.reasoning,
+  };
+  // Each demoted candidate's why-not: the model's original rebuttal for that code
+  // when it had one, else the candidate's own reasoning (the ex-#1 has no rebuttal
+  // — fall back to its reasoning rather than mislabel its defense as a rejection).
+  const why_not: WhyNot[] = rest.map((c) => ({
+    hts_code: c.hts_code,
+    why: rebuttalByCode.get(c.hts_code) ?? c.reasoning,
+  }));
+  return { candidates: ranked, recommendation, why_not };
+}
+
 // ── Orchestration ────────────────────────────────────────────────────────────
 
 /** Arguments handed to the (injectable) model call. */
@@ -324,6 +493,15 @@ export interface ClassificationDeps {
   tools: ToolSet;
   generate: GenerateFn;
   maxSteps?: number;
+  /**
+   * Opt into the Task-6.3 retrieval-support re-selection: re-rank the model's own
+   * three candidates by the rank of their supporting corpus chunk before returning
+   * (`reselectByRetrievalSupport`). Defaults to OFF — the shipped ranking is the
+   * model's — so this is an explicit, measured A/B arm, not a silent behavior
+   * change. The production route resolves it from `AGENT_RESELECT` via
+   * {@link resolveReselect}; the eval harness sets it per run.
+   */
+  reselect?: boolean;
 }
 
 /**
@@ -464,10 +642,22 @@ export async function runClassification(
     );
   }
 
+  // Task-6.3 lever (opt-in): re-rank the model's own defensible candidates by the
+  // retrieval position of their supporting chunk. A pure permutation of the three
+  // (top-3 set unchanged), applied AFTER the indefensible check — which is
+  // order-independent, so gating it before/after is equivalent — so the only
+  // thing that can move between the OFF/ON arms is the top-1 pick.
+  const ranked: RankedClassification = deps.reselect
+    ? reselectByRetrievalSupport(
+        { candidates, recommendation: output.recommendation, why_not: output.why_not },
+        allowed.chunks,
+      )
+    : { candidates, recommendation: output.recommendation, why_not: output.why_not };
+
   return {
-    candidates,
-    recommendation: output.recommendation,
-    why_not: output.why_not,
+    candidates: ranked.candidates,
+    recommendation: ranked.recommendation,
+    why_not: ranked.why_not,
     sources_used: deriveSourcesUsed(steps),
   };
 }

@@ -155,6 +155,10 @@ export interface ReportData {
   ks: number[];
   recallDigits: number[];
   accuracyDigits: number[];
+  /** Whether the Task-6.3 agent-side re-selection lever was ON for this run's
+   *  end-to-end + RAG suites. Recorded so a report self-documents which agent arm
+   *  its accuracy numbers measured (the retrieval mode is fixed across both). */
+  reselect?: boolean;
   leakage: LeakageSummary;
   recall: RecallSuite[];
   accuracy: AccuracySuite[];
@@ -324,6 +328,16 @@ export function renderReport(data: ReportData): string {
       "columns isolate the Task-6 retrieval change.",
   );
   lines.push("");
+  if (data.reselect != null) {
+    lines.push(
+      `**Agent re-selection (Task 6.3):** \`${data.reselect ? "ON" : "off"}\` for the end-to-end + RAG ` +
+        "suites — the agent-side lever that re-ranks the model's own three candidates by their supporting " +
+        "chunk's retrieval position. For a fixed model output it is a pure permutation (top-3 set unchanged), " +
+        "so across an OFF vs ON pair `top-1 exact` carries the effect while `top-3 recall` moves only within " +
+        "model-sampling noise; compare this run's top-1 against a run with the opposite setting.",
+    );
+    lines.push("");
+  }
 
   // AE4 — must come first: a failed leakage guard invalidates every number below.
   lines.push("## AE4 — leakage guard");

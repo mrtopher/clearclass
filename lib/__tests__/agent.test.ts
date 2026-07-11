@@ -2,16 +2,21 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   buildSystemPrompt,
+  candidateSupportRank,
   collectRetrievedChunkIds,
+  collectRetrievedChunks,
   collectWebUrls,
   deriveSourcesUsed,
   latestUserText,
   normalizeMessages,
+  reselectByRetrievalSupport,
+  resolveReselect,
   runClassification,
   validateCandidateCitations,
   RETRIEVE_TOOL,
   WEB_SEARCH_TOOL,
   type GenerateFn,
+  type RankedClassification,
   type RetrievedChunkMeta,
   type RetrievedIndex,
   type StepLike,
@@ -407,6 +412,208 @@ describe("runClassification", () => {
   });
 });
 
+// ── Task 6.3: retrieval-support re-selection ─────────────────────────────────
+
+/** A retrieve step carrying explicit similarity per chunk (rank = array index). */
+function retrieveStepScored(chunks: Array<{ id: number; similarity?: number }>): StepLike {
+  return {
+    toolResults: [
+      { toolName: RETRIEVE_TOOL, output: { count: chunks.length, chunks } },
+    ],
+  };
+}
+/** A candidate at `code`, whose corpus citations point at the given chunk ids. */
+function candFor(code: string, chunkIds: number[]): Candidate {
+  return {
+    hts_code: code,
+    reasoning: `reasoning-${code}`,
+    citations: chunkIds.map((id) => ({ ...corpusCitation(id), hts_code: code })),
+    confidence: 0.5,
+  };
+}
+function ranksMap(entries: Array<[number, number]>): Map<number, RetrievedChunkMeta> {
+  return new Map(entries.map(([id, rank]) => [id, { rank }]));
+}
+
+describe("collectRetrievedChunks (rank capture)", () => {
+  it("records position among valid rows as rank (0 = top)", () => {
+    const m = collectRetrievedChunks([retrieveStepScored([{ id: 10 }, { id: 11 }])]);
+    expect(m.get(10)?.rank).toBe(0);
+    expect(m.get(11)?.rank).toBe(1);
+  });
+
+  it("keeps the BEST (smallest) rank across calls", () => {
+    const m = collectRetrievedChunks([
+      retrieveStepScored([{ id: 7 }, { id: 8 }, { id: 9 }]), // 9 @ rank 2
+      retrieveStepScored([{ id: 9 }]), //                        9 @ rank 0
+    ]);
+    expect(m.get(9)?.rank).toBe(0);
+  });
+
+  it("skips an id-less row without shifting later rows' ranks", () => {
+    const step: StepLike = {
+      toolResults: [
+        { toolName: RETRIEVE_TOOL, output: { count: 3, chunks: [{ id: 4 }, { id: "x" }, { id: 5 }] } },
+      ],
+    };
+    const m = collectRetrievedChunks([step]);
+    expect(m.get(4)?.rank).toBe(0);
+    expect(m.get(5)?.rank).toBe(1); // not 2 — the malformed middle row consumed no rank
+  });
+});
+
+describe("candidateSupportRank", () => {
+  const chunks = ranksMap([
+    [10, 1],
+    [20, 0],
+    [50, 5],
+  ]);
+
+  it("returns the best (smallest) rank among a candidate's cited retrieved chunks", () => {
+    expect(candidateSupportRank(candFor("x", [50, 20]), chunks)).toBe(0);
+    expect(candidateSupportRank(candFor("x", [50, 10]), chunks)).toBe(1);
+  });
+
+  it("is +Infinity when nothing the candidate cites was retrieved (no signal)", () => {
+    expect(candidateSupportRank(candFor("x", [999]), chunks)).toBe(Number.POSITIVE_INFINITY);
+    const webOnly: Candidate = { ...candFor("x", []), citations: [webCitation("https://u")] };
+    expect(candidateSupportRank(webOnly, chunks)).toBe(Number.POSITIVE_INFINITY);
+  });
+});
+
+describe("reselectByRetrievalSupport", () => {
+  const A = candFor("1111.11.1111", [20]); // rank 2
+  const B = candFor("2222.22.2222", [10]); // rank 0  → should win #1
+  const C = candFor("3333.33.3333", [50]); // rank 5
+  const chunks = ranksMap([
+    [20, 2],
+    [10, 0],
+    [50, 5],
+  ]);
+  const input: RankedClassification = {
+    candidates: [A, B, C],
+    recommendation: { hts_code: A.hts_code, why: "A is best" },
+    why_not: [
+      { hts_code: B.hts_code, why: "not B" },
+      { hts_code: C.hts_code, why: "not C" },
+    ],
+  };
+
+  it("re-ranks candidates by supporting-chunk rank and rebuilds a POLARITY-correct rec/why-not", () => {
+    const out = reselectByRetrievalSupport(input, chunks);
+    expect(out.candidates.map((c) => c.hts_code)).toEqual([B.hts_code, A.hts_code, C.hts_code]);
+    // B was a *rejected* candidate ("not B"); promoted to #1 it must NOT be "defended"
+    // by its own rebuttal — it gets its own positive reasoning instead.
+    expect(out.recommendation).toEqual({ hts_code: B.hts_code, why: `reasoning-${B.hts_code}` });
+    expect(out.recommendation.why).not.toBe("not B");
+    // The demoted ex-#1 (A) has no rebuttal text → its own reasoning, not "A is best"
+    // mislabeled as a rejection; C keeps its genuine rebuttal.
+    expect(out.why_not).toEqual([
+      { hts_code: A.hts_code, why: `reasoning-${A.hts_code}` },
+      { hts_code: C.hts_code, why: "not C" },
+    ]);
+  });
+
+  it("keeps the model's own defense when re-selection does NOT change the #1 pick", () => {
+    // A already has the best support (rank 0) → order unchanged → keep "A is best".
+    const chunksAtop = ranksMap([
+      [20, 0], // A cites 20
+      [10, 2], // B cites 10
+      [50, 5], // C cites 50
+    ]);
+    const out = reselectByRetrievalSupport(input, chunksAtop);
+    expect(out.candidates.map((c) => c.hts_code)).toEqual([A.hts_code, B.hts_code, C.hts_code]);
+    expect(out.recommendation).toEqual({ hts_code: A.hts_code, why: "A is best" });
+    expect(out.why_not).toEqual([
+      { hts_code: B.hts_code, why: "not B" },
+      { hts_code: C.hts_code, why: "not C" },
+    ]);
+  });
+
+  it("leaves the top-3 SET unchanged — it is a permutation, so top-3 recall can't move", () => {
+    const out = reselectByRetrievalSupport(input, chunks);
+    expect(new Set(out.candidates.map((c) => c.hts_code))).toEqual(
+      new Set(input.candidates.map((c) => c.hts_code)),
+    );
+  });
+
+  it("is stable: with no retrieval signal it preserves the model's original order", () => {
+    const out = reselectByRetrievalSupport(input, new Map());
+    expect(out.candidates.map((c) => c.hts_code)).toEqual([A.hts_code, B.hts_code, C.hts_code]);
+    expect(out.recommendation.hts_code).toBe(A.hts_code);
+  });
+
+  it("falls back to the candidate's own reasoning when no code-matching rationale exists", () => {
+    const orphan: RankedClassification = {
+      candidates: [A, B, C],
+      recommendation: { hts_code: "zzz", why: "z" },
+      why_not: [
+        { hts_code: "yyy", why: "y" },
+        { hts_code: "xxx", why: "x" },
+      ],
+    };
+    const out = reselectByRetrievalSupport(orphan, chunks);
+    expect(out.recommendation).toEqual({ hts_code: B.hts_code, why: `reasoning-${B.hts_code}` });
+  });
+});
+
+describe("resolveReselect", () => {
+  it("is off by default/empty and for explicit off-ish values", () => {
+    expect(resolveReselect("")).toBe(false);
+    expect(resolveReselect("off")).toBe(false);
+    expect(resolveReselect("false")).toBe(false);
+    expect(resolveReselect("0")).toBe(false);
+  });
+
+  it("is on for on/true/1", () => {
+    expect(resolveReselect("on")).toBe(true);
+    expect(resolveReselect("true")).toBe(true);
+    expect(resolveReselect("1")).toBe(true);
+  });
+
+  it("warns and stays off on an unrecognized value (never silently flips the arm)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(resolveReselect("sometimes")).toBe(false);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
+describe("runClassification with reselect", () => {
+  const tools = {} as never;
+  const A = candFor("1111.11.1111", [10]);
+  const B = candFor("2222.22.2222", [20]);
+  const C = candFor("3333.33.3333", [50]);
+  const output: Classification = {
+    candidates: [A, B, C],
+    recommendation: { hts_code: A.hts_code, why: "model picked A" },
+    why_not: [
+      { hts_code: B.hts_code, why: "not B" },
+      { hts_code: C.hts_code, why: "not C" },
+    ],
+  };
+  // Retrieved order puts B's supporting chunk (20) at the very top.
+  const steps = [retrieveStep([20, 10, 50])]; // 20 @ rank 0, 10 @ rank 1, 50 @ rank 2
+
+  it("ON: promotes the candidate whose supporting chunk retrieval ranked highest", async () => {
+    const result = await runClassification(
+      { messages: "x" },
+      { tools, generate: fakeGenerate(output, steps), reselect: true },
+    );
+    expect(result.candidates.map((c) => c.hts_code)).toEqual([B.hts_code, A.hts_code, C.hts_code]);
+    expect(result.recommendation.hts_code).toBe(B.hts_code);
+  });
+
+  it("OFF (default): keeps the model's own candidate order untouched", async () => {
+    const off = await runClassification(
+      { messages: "x" },
+      { tools, generate: fakeGenerate(output, steps) },
+    );
+    expect(off.candidates.map((c) => c.hts_code)).toEqual([A.hts_code, B.hts_code, C.hts_code]);
+    expect(off.recommendation.hts_code).toBe(A.hts_code);
+  });
+});
+
 // ── createRunAgent: the wired entry point (success + error mapping) ───────────
 
 const TENANT: TenantContext = {
@@ -458,6 +665,36 @@ describe("createRunAgent", () => {
 
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toMatchObject({ error: "invalid_request" });
+  });
+
+  it("wires the Task-6.3 lever: reselect:true re-ranks the candidates at the route seam", async () => {
+    const A = candFor("1111.11.1111", [10]);
+    const B = candFor("2222.22.2222", [20]);
+    const C = candFor("3333.33.3333", [50]);
+    const output: Classification = {
+      candidates: [A, B, C],
+      recommendation: { hts_code: A.hts_code, why: "A" },
+      why_not: [
+        { hts_code: B.hts_code, why: "nb" },
+        { hts_code: C.hts_code, why: "nc" },
+      ],
+    };
+    const runAgent = createRunAgent({
+      tools: {},
+      generate: fakeGenerate(output, [retrieveStep([20, 10, 50])]), // 20 (B's chunk) @ rank 0
+      memory: fakeMemory(),
+      reselect: true,
+    });
+
+    const res = await runAgent({ messages: "x", tenant: TENANT });
+
+    const body = await res.json();
+    expect(body.candidates.map((c: { hts_code: string }) => c.hts_code)).toEqual([
+      B.hts_code,
+      A.hts_code,
+      C.hts_code,
+    ]);
+    expect(body.recommendation.hts_code).toBe(B.hts_code);
   });
 
   it("returns a flagged 502 on model failure WITHOUT leaking the error detail", async () => {
