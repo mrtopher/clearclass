@@ -262,15 +262,26 @@ async function insertRows(cfg: AdminConfig, rows: DocumentRow[]): Promise<number
   return contentRangeTotal(res);
 }
 
-/** Delete every corpus row so a re-run replaces rather than duplicates. */
+/**
+ * Reset the corpus so a re-run replaces rather than duplicates.
+ *
+ * Uses the `reset_documents` RPC (which runs SQL `TRUNCATE`), NOT a PostgREST
+ * DELETE. A DELETE does not reclaim pgvector HNSW graph nodes — deleted vectors
+ * leave tombstones, so repeated delete-and-reload cycles bloat the index
+ * unboundedly (this once grew it to ~248 MB and OOM-killed the database).
+ * TRUNCATE resets the heap and the index files together, so the bloat cannot
+ * accumulate. See migrations/20260711210000_reset-documents-truncate-rpc.sql.
+ */
 async function truncateTable(cfg: AdminConfig): Promise<void> {
-  // PostgREST refuses an unfiltered delete; `id >= 0` matches all BIGSERIAL rows.
-  const res = await adminFetch(recordsUrl(cfg, "?id=gte.0"), {
-    method: "DELETE",
+  const res = await adminFetch(`${cfg.baseUrl}/api/database/rpc/reset_documents`, {
+    method: "POST",
     headers: authHeaders(cfg),
+    body: "{}",
   });
   if (!res.ok) {
-    throw new Error(`failed to truncate ${TABLE}: HTTP ${res.status}`);
+    throw new Error(
+      `failed to reset ${TABLE}: HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`,
+    );
   }
 }
 

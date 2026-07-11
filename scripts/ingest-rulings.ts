@@ -54,12 +54,14 @@ const MIRROR_BASE =
 
 const DEFAULT_OUT = "data/ruling-chunks.jsonl";
 const TEST_SPLIT_PATH = "data/eval-test-split.jsonl";
-/** Seed target after leakage filtering (plan: ~300). */
-const DEFAULT_TARGET = 300;
+/** Seed target after leakage filtering (broadened from the original ~300 to
+ * lift retrieval recall — the eval's dominant top-1 loss is "code never
+ * retrieved", so more precedent is the highest lever; see SUBMISSION.md Task 7). */
+const DEFAULT_TARGET = 2000;
 /** Hard floor for a full run — below this the fetch clearly failed/truncated. */
 const MIN_RULINGS = 120;
 const PAGE_SIZE = 40;
-const MAX_PAGES_PER_TERM = 2;
+const MAX_PAGES_PER_TERM = 4;
 const POLITE_DELAY_MS = 250;
 
 /**
@@ -75,6 +77,13 @@ const SEED_TERMS = [
   "ceramic", "toy", "jewelry", "rubber", "paper", "textile fabric", "hat",
   "gloves", "chemical", "food preparation", "beverage", "cosmetic", "fastener",
   "hand tool", "bicycle", "vehicle part",
+  // Broadened coverage: terms spanning HTS chapters the original 32 missed, so
+  // the precedent seed reaches product families beyond the initial sample.
+  "optical instrument", "medical device", "watch", "clock", "musical instrument",
+  "pharmaceutical", "coffee", "tea", "frozen fish", "prepared meat", "sauce",
+  "printed book", "carpet", "umbrella", "camera", "copper wire", "steel tube",
+  "stone article", "sporting goods", "aircraft part", "ship", "brush",
+  "mattress", "sunglasses",
 ];
 
 export interface RulingsArgs {

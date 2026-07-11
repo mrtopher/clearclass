@@ -10,8 +10,8 @@ import { parseArgs } from "@/scripts/ingest-rulings";
  * importing it here triggers no network.
  */
 describe("ingest-rulings parseArgs", () => {
-  it("defaults to the canonical output path and ~300 target", () => {
-    expect(parseArgs([])).toEqual({ out: "data/ruling-chunks.jsonl", target: 300 });
+  it("defaults to the canonical output path and the broadened 2000 target", () => {
+    expect(parseArgs([])).toEqual({ out: "data/ruling-chunks.jsonl", target: 2000 });
   });
 
   it("parses --out and --target overrides", () => {
