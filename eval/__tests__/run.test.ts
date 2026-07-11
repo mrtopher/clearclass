@@ -18,6 +18,15 @@ describe("parseArgs", () => {
     expect(args.recallOnly).toBe(false);
     expect(args.concurrency).toBe(6);
     expect(args.out).toBe("eval/report.md");
+    expect(args.rewrite).toBe("off");
+  });
+
+  it("defaults --rewrite off; bare flag → expand; explicit values are honored", () => {
+    expect(parseArgs([]).rewrite).toBe("off");
+    expect(parseArgs(["--rewrite"]).rewrite).toBe("expand");
+    expect(parseArgs(["--rewrite=expand"]).rewrite).toBe("expand");
+    expect(parseArgs(["--rewrite=hyde"]).rewrite).toBe("hyde");
+    expect(parseArgs(["--rewrite=off"]).rewrite).toBe("off");
   });
 
   it("parses --concurrency and rejects a non-positive value", () => {

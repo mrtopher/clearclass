@@ -128,4 +128,32 @@ describe("createConfiguredRetriever", () => {
     // Construction must not throw; the resolved mode is exercised by the arm tests.
     expect(typeof createConfiguredRetriever()).toBe("function");
   });
+
+  it("threads the Task-7 query-rewrite lever through to the retriever", async () => {
+    // The injected rewrite fn runs BEFORE the underlying dense arm (which then
+    // fails without gateway creds in the test env). Proving it was called with the
+    // original query confirms `deps.rewrite`/`deps.rewriteFn` are wired to
+    // `withQueryRewrite`, not dropped.
+    const rewriteFn = vi.fn(async () => "rewritten tariff phrasing");
+    const retriever = createConfiguredRetriever("dense", { rewrite: "hyde", rewriteFn });
+    // The underlying dense arm throws without gateway creds in the test env (sync or
+    // async); try/catch swallows either so we can assert the rewrite ran first.
+    try {
+      await retriever("a stallion for breeding");
+    } catch {
+      /* expected: no creds downstream */
+    }
+    expect(rewriteFn).toHaveBeenCalledWith("a stallion for breeding");
+  });
+
+  it("does NOT rewrite when the lever is off (default)", async () => {
+    const rewriteFn = vi.fn(async () => "should not be used");
+    const retriever = createConfiguredRetriever("dense", { rewrite: "off", rewriteFn });
+    try {
+      await retriever("a stallion for breeding");
+    } catch {
+      /* expected: no creds downstream */
+    }
+    expect(rewriteFn).not.toHaveBeenCalled();
+  });
 });

@@ -23,7 +23,7 @@
  * metrics come last and clearly scoped to their subset.
  */
 import { codeDigits, matchesAtDigits, type RecallResult } from "@/eval/retrieval-recall";
-import type { RetrievalMode } from "@/lib/retrieval";
+import type { QueryRewriteMode, RetrievalMode } from "@/lib/retrieval";
 import type { ClassificationResult } from "@/lib/schema";
 
 /** Digit levels the accuracy suite reports: full 10-digit, the 6-digit HS layer,
@@ -121,6 +121,14 @@ export interface RecallSuite {
    * `renderReport` surfaces this so a degraded run can't masquerade as a real one.
    */
   rerankFallbacks?: number;
+  /**
+   * Task-7 query-rewrite lever: rows whose rewrite degraded to the ORIGINAL query
+   * (gateway outage/timeout/missing key/empty output). Undefined when the lever is
+   * off (never rewrites). A high value means the "rewritten" numbers actually
+   * measure un-rewritten queries — surfaced like `rerankFallbacks` so a degraded
+   * rewrite run can't masquerade as a real one.
+   */
+  rewriteFallbacks?: number;
 }
 
 /** Per-mode end-to-end accuracy suite result. */
@@ -159,6 +167,10 @@ export interface ReportData {
    *  end-to-end + RAG suites. Recorded so a report self-documents which agent arm
    *  its accuracy numbers measured (the retrieval mode is fixed across both). */
   reselect?: boolean;
+  /** Task-7 query-rewrite mode active for THIS run's suites (`off` when the lever
+   *  is disabled). Recorded so the report self-documents which query arm — original
+   *  vs rewritten — its numbers measured, applied identically to both retrieval modes. */
+  rewrite?: QueryRewriteMode;
   leakage: LeakageSummary;
   recall: RecallSuite[];
   accuracy: AccuracySuite[];
@@ -195,6 +207,31 @@ function rerankHealthNote(recall: readonly RecallSuite[]): string | null {
     "(rate-limit / outage / missing `COHERE_API_KEY`). For those rows the `hybrid+rerank` column " +
     "above measures **fused-hybrid, not reranked** retrieval — re-run with a healthy Cohere key " +
     "before trusting the advanced numbers or the headline lift."
+  );
+}
+
+/**
+ * A blockquote warning when the query-rewrite lever silently degraded to the
+ * original query on a meaningful fraction of rows, else `null`. Uses the SAME
+ * fail-closed threshold as the reranker note: once a meaningful share of rewrites
+ * never ran, the "rewritten" numbers are measuring un-rewritten queries and must
+ * say so. Checks the highest fallback count across whichever modes ran (the lever
+ * applies to both arms identically).
+ */
+function rewriteHealthNote(recall: readonly RecallSuite[]): string | null {
+  let worst: { n: number; scored: number } | null = null;
+  for (const s of recall) {
+    if (s.rewriteFallbacks == null || s.scored <= 0) continue;
+    if (!worst || s.rewriteFallbacks / s.scored > worst.n / worst.scored) {
+      worst = { n: s.rewriteFallbacks, scored: s.scored };
+    }
+  }
+  if (!worst || worst.n / worst.scored < RERANK_FALLBACK_WARN_FRACTION) return null;
+  return (
+    `> ⚠️ **Query rewrite degraded — the rewrite did not run on ${worst.n}/${worst.scored} rows.** ` +
+    "Those queries fell back to the ORIGINAL (un-rewritten) text because the rewrite gateway call failed " +
+    "(rate-limit / outage / missing key / empty output). For those rows the numbers above measure " +
+    "**un-rewritten** retrieval — re-run with a healthy gateway before trusting the rewrite lift."
   );
 }
 
@@ -328,6 +365,15 @@ export function renderReport(data: ReportData): string {
       "columns isolate the Task-6 retrieval change.",
   );
   lines.push("");
+  if (data.rewrite && data.rewrite !== "off") {
+    lines.push(
+      `**Query rewrite (Task 7):** \`${data.rewrite}\` — the product description is rewritten into ` +
+        "tariff-line phrasing before retrieval (a HyDE-style register match), applied identically to BOTH " +
+        "retrieval modes. Compare this run's numbers against a `QUERY_REWRITE=off` run to read the lift; the " +
+        "dense-vs-hybrid delta columns below still isolate the retrieval mode with the rewrite held fixed.",
+    );
+    lines.push("");
+  }
   if (data.reselect != null) {
     lines.push(
       `**Agent re-selection (Task 6.3):** \`${data.reselect ? "ON" : "off"}\` for the end-to-end + RAG ` +
@@ -387,6 +433,11 @@ export function renderReport(data: ReportData): string {
   const rerankNote = rerankHealthNote(data.recall);
   if (rerankNote) {
     lines.push(rerankNote);
+    lines.push("");
+  }
+  const rewriteNote = rewriteHealthNote(data.recall);
+  if (rewriteNote) {
+    lines.push(rewriteNote);
     lines.push("");
   }
   const lift = headlineRecallLift(data);

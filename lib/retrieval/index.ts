@@ -17,6 +17,12 @@
  * live agent's behaviour and cost unchanged — no Cohere call on the billable path
  * — until that decision is made. (The advanced arm still degrades gracefully to
  * fused-hybrid order if the key is absent, so an accidental flip can't hard-fail.)
+ *
+ * Task 7 adds a SECOND, orthogonal config axis: `QUERY_REWRITE` (`off` default)
+ * wraps EITHER arm with a HyDE-style query rewrite (`rewrite.ts`) — retrieval-time
+ * query transformation, independent of which retriever runs underneath. So a
+ * production config is a (mode × rewrite) pair, and the eval harness A/Bs each axis
+ * with the other held fixed.
  */
 import {
   clampK,
@@ -30,6 +36,22 @@ import {
   type HybridRetriever,
 } from "@/lib/retrieval/hybrid";
 import { createCohereRerank, rerankChunks, type RerankFn } from "@/lib/retrieval/rerank";
+import {
+  createLlmRewrite,
+  resolveQueryRewrite,
+  withQueryRewrite,
+  type QueryRewriteMode,
+  type RewriteFn,
+} from "@/lib/retrieval/rewrite";
+
+/** Re-export the Task-7 query-rewrite surface so callers (the eval harness, the
+ *  agent tool) import the whole retrieval-config vocabulary from one module. */
+export {
+  resolveQueryRewrite,
+  DEFAULT_QUERY_REWRITE_MODE,
+  type QueryRewriteMode,
+  type RewriteStrategy,
+} from "@/lib/retrieval/rewrite";
 
 /** The two Task-6 retrieval arms. `hybrid+rerank` is the advanced arm. */
 export type RetrievalMode = "dense" | "hybrid+rerank";
@@ -72,6 +94,22 @@ export interface AdvancedRetrieverDeps {
    * flagged in the report rather than silently reported as reranked retrieval.
    */
   onRerankFallback?: () => void;
+  /**
+   * Task-7 query-rewrite lever (`lib/retrieval/rewrite.ts`), applied to BOTH modes.
+   * Defaults to the `QUERY_REWRITE` env mode; the eval harness passes it explicitly
+   * so the A/B holds the rest of the pipeline fixed. `off` (the default) leaves the
+   * retriever untouched.
+   */
+  rewrite?: QueryRewriteMode;
+  /** Override the rewrite transport (defaults to the live gateway); for tests. */
+  rewriteFn?: RewriteFn;
+  /**
+   * Health sink fired once per query when the rewrite degrades to the ORIGINAL
+   * query (gateway outage/timeout/missing key/empty output). The eval harness wires
+   * this to a per-run counter so a degraded rewrite run is flagged rather than
+   * silently reported as rewritten — mirroring `onRerankFallback`.
+   */
+  onRewriteFallback?: () => void;
 }
 
 /**
@@ -102,7 +140,14 @@ export function createConfiguredRetriever(
   mode: RetrievalMode = resolveRetrievalMode(),
   deps: AdvancedRetrieverDeps = {},
 ): DenseRetriever {
-  // `deps` (incl. the rerank-health sink) only applies to the advanced arm; the
+  // The rerank-health sink and candidate pool only apply to the advanced arm; the
   // dense baseline never reranks, so it has nothing to fall back FROM.
-  return mode === "hybrid+rerank" ? createAdvancedRetriever(deps) : createDenseRetriever();
+  const base = mode === "hybrid+rerank" ? createAdvancedRetriever(deps) : createDenseRetriever();
+  // The query-rewrite lever (Task 7) wraps EITHER arm — it is retrieval-time query
+  // transformation, orthogonal to which retriever runs underneath.
+  const rewriteMode = deps.rewrite ?? resolveQueryRewrite();
+  return withQueryRewrite(base, rewriteMode, {
+    rewrite: deps.rewriteFn ?? createLlmRewrite(),
+    onFallback: deps.onRewriteFallback,
+  });
 }
