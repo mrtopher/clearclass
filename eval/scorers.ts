@@ -428,6 +428,14 @@ export function renderReport(data: ReportData): string {
       "separate by design; each metric averages only its non-null judgments).",
   );
   lines.push("");
+  lines.push(
+    "> **AnswerRelevancy note:** we keep autoevals' question generation but recompute the score as " +
+      "the mean **raw** cosine between each generated question and the query. Stock `autoevals` runs that " +
+      "cosine through `EmbeddingSimilarity`'s hardcoded 0.7 floor (`(cos − 0.7) / 0.3`, clamped), which " +
+      "collapses genuinely-relevant question↔description pairs (~0.48 cosine) to 0 on every row — RAGAS " +
+      "itself uses the unfloored cosine. See `eval/run.ts#answerRelevancy`.",
+  );
+  lines.push("");
   if (ragForNames) {
     const metricNames = ragForNames.scores.map((s) => s.name);
     const values = (suite: RagSuite | undefined): (number | null)[] | null =>
