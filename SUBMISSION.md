@@ -1,0 +1,306 @@
+# ClearClass — Certification Challenge Submission
+
+**Defensible HTS classification for licensed customs brokers.**
+
+- **Live app:** https://bp6d8gmu.insforge.site
+- **Demo login (read-only demo tenant):** `broker@clearclass.demo` / `ClearClassDemo!2026`
+- **Loom demo:** _(link to be added)_
+- **Repo:** this repository. Plan of record: [`docs/plans/2026-07-08-001-feat-clearclass-hts-classifier-plan.md`](docs/plans/2026-07-08-001-feat-clearclass-hts-classifier-plan.md); strategy: [`STRATEGY.md`](STRATEGY.md).
+
+This document addresses each deliverable for Tasks 1–7. Evidence for Tasks 5–6 is the committed evaluation report, [`eval/report.md`](eval/report.md), reproducible with `npm run eval`.
+
+---
+
+## Task 1 — Problem, Audience, and Scope
+
+### Problem (one sentence, no solution)
+
+Licensed customs brokers must assign every imported product a single correct Harmonized Tariff Schedule (HTS) code, but doing so demands reconciling dense tariff rules, the General Rules of Interpretation, and prior customs rulings against a product's specific attributes — and an indefensible call means fines, shipment delays, or mis-paid duty.
+
+### Why this is a problem for this user
+
+**Who has it:** the licensed customs broker / import-compliance specialist who signs off on entries. Classification is judgment-heavy and legally consequential: the broker's name is on the filing, and if U.S. Customs and Border Protection (CBP) challenges a code, the broker must *defend* it.
+
+**What they're trying to do, and how they handle it today:** for a new or ambiguous product they manually cross-reference the ~23k-line USITC tariff schedule, walk the six General Rules of Interpretation (GRI) in order, and search the CBP CROSS rulings database for precedent on similar goods — reconciling all of it against the product's material, use, and form. **Why that's not good enough:** it is slow and inconsistent, and — the real pain — the output of an hour of cross-referencing is often *a code without a written, cited rationale*. When CBP asks "why 6109.10.0040 and not 6110.20.2010?", the broker needs the reasoning and the sources, not just the number. The cost of being *indefensible* is borne later, when the entry is challenged.
+
+### Current-state workflow (how the user solves this today)
+
+```mermaid
+flowchart TD
+    A[New / ambiguous product to classify] --> B[Read product spec:<br/>material, use, form]
+    B --> C{Obvious heading?}
+    C -->|No| D[Search USITC HTS<br/>~23k tariff lines]
+    C -->|Maybe| D
+    D --> E[Walk GRI 1..6 in order<br/>to resolve competing headings]
+    E --> F[Search CBP CROSS rulings<br/>for precedent on similar goods]
+    F --> G{Precedent found<br/>and applicable?}
+    G -->|No| H[Interpret from tariff text alone]
+    G -->|Yes| I[Reconcile ruling vs. product attributes]
+    H --> J[Pick a candidate code]
+    I --> J
+    J --> K{Confident + defensible?}
+    K -->|No| D
+    K -->|Yes| L[File entry — code recorded<br/>WITHOUT a written cited rationale]
+    L --> M[[If CBP challenges later:<br/>reconstruct the reasoning from memory]]
+
+    classDef pain fill:#ffe0e0,stroke:#c00,color:#000;
+    class D,E,F,M pain
+```
+
+Red nodes are the slow / repetitive / error-prone points: manual search across three separate authorities (tariff, GRI, rulings), and — most costly — a filed code whose justification lives only in the broker's head, reconstructed under pressure if challenged.
+
+### Evaluation input/output pairs
+
+Ground truth comes from real CBP rulings (the flexifyai CROSS-derived dataset — a labeled *product description → gold HTS code* set), held out as a 200-row test split ([`data/eval-test-split.jsonl`](data/eval-test-split.jsonl)). Representative pairs:
+
+| Product description (input) | Gold HTS code (output) |
+|---|---|
+| A woman's knit cotton t-shirt | `6109.10.0040` |
+| Cast carbon steel pipe fittings (ASTM A216), two flanges + nuts/bolts | `7307.19.9060` |
+| Gasoline spark-ignition piston engines (4476 W–18.65 kW) for pumps | `8407.90.9060` |
+
+The harness scores the agent's output against these at 10-, 6-, and 4-digit precision (Task 5).
+
+---
+
+## Task 2 — Proposed Solution
+
+### Solution (one sentence)
+
+ClearClass is a browser-based Agentic RAG assistant that turns a product description into the **top-3 ranked candidate HTS codes**, each with GRI-based reasoning, source citations, and a recommendation of one over the others — grounded in an uploaded HTS/GRI/rulings corpus and augmented by live web search — so a broker gets an answer they can *defend*, not just an answer.
+
+### Infrastructure diagram
+
+```mermaid
+flowchart TB
+    subgraph Client["Browser — phone and laptop"]
+        UI["Next.js App Router UI<br/>login + classifier chat"]
+    end
+
+    subgraph App["Next.js server (Insforge Sites, Vercel-backed)"]
+        MW["middleware.ts<br/>JWT session + rate limit"]
+        GATE["lib/chat-gate — U11 auth gate"]
+        AGENT["lib/agent — AI SDK agent loop<br/>(Vercel AI SDK)"]
+    end
+
+    subgraph Insforge["Insforge backend"]
+        PG[("Postgres + pgvector<br/>HNSW index")]
+        DOCS["documents:<br/>HTS · GRI · rulings"]
+        MEM["classifications:<br/>per-importer memory"]
+        AUTH["Auth — JWT / RLS"]
+        GW["OpenAI-compatible LLM gateway<br/>→ OpenRouter"]
+    end
+
+    subgraph External["External APIs (server-only keys)"]
+        TAV["Tavily — live web search"]
+        COH["Cohere Rerank — cross-encoder"]
+        MODELS["gpt-4o-mini (chat)<br/>text-embedding-3-small (1536-dim)"]
+    end
+
+    subgraph Offline["Offline (npm scripts)"]
+        INGEST["ingest + embed-load<br/>corpus build"]
+        EVAL["eval/ — recall@k + accuracy<br/>+ autoevals (RAGAS)"]
+    end
+
+    UI <--> MW --> GATE --> AGENT
+    UI --- AUTH
+    AGENT -->|retrieve tool| PG
+    PG --- DOCS
+    PG --- MEM
+    AGENT -->|web_search tool| TAV
+    AGENT -->|rerank advanced arm| COH
+    AGENT -->|completions + embeddings| GW --> MODELS
+    INGEST --> PG
+    EVAL -.->|drives same agent path| AGENT
+```
+
+**Why each component:**
+
+| Component | Choice | Why |
+|---|---|---|
+| **LLM** | `gpt-4o-mini` (COTS) | Cheap, fast, strong enough for GRI reasoning + structured output; the challenge targets *a measurable improvement over a naive baseline*, not SOTA, and cost matters at 400-row eval scale. |
+| **LLM gateway** | Insforge OpenAI-compatible gateway → OpenRouter | One provider-agnostic client for both completions **and** embeddings (KTD9); swappable to Vercel AI Gateway without touching call sites. |
+| **Agent framework** | Vercel AI SDK (`generateText` multi-step tool loop) | Native retrieve→decide→search→synthesize loop with a forced structured-output schema; one TypeScript stack end to end. |
+| **Tools** | `retrieve` (corpus) + `web_search` (Tavily) | Corpus is the authoritative source for codes; Tavily supplies currency for recent trade actions the corpus can't cover. |
+| **Embedding model** | `text-embedding-3-small`, 1536-dim | Good quality at low cost; kept in lockstep with the `vector(1536)` column. |
+| **Vector DB** | Postgres + pgvector (Insforge), HNSW index | Corpus **and** per-importer memory in one store with cosine + lexical search; RLS isolates tenant data. |
+| **Memory** | `classifications` table + per-importer vector search | Surfaces the importer's prior similar classifications as cited precedent — consistency is itself a defensibility argument. |
+| **Monitoring** | Gateway request logs (OpenRouter) + Insforge platform logs (`postgres`/`postgrest`/function) + `/api/health` gateway smoke + server-side structured logs (dropped/fabricated citations, degraded 502s) | Observability across the model, data, and app layers without a separate SaaS. (Langfuse tracing is a planned enhancement — see Task 7.) |
+| **Evaluation** | Custom TS deterministic scorer + `autoevals` (Braintrust RAGAS port) | Deterministic exact-match accuracy **and** LLM-judged RAG quality, run headlessly through the same agent path. |
+| **UI** | Next.js App Router chat (login + classifier), responsive | Runs in a browser on phone and laptop; renders candidates, citations, and confidence. |
+| **Deployment** | Insforge Sites (Vercel-backed), public endpoint | Public URL hosting the server-side agent loop; deploy env applied per build. |
+| **Auth / tenancy** | Insforge Auth (JWT) + RLS, server-derived tenant key | No billable call without a session; the importer key comes from verified token claims, never the client (KTD10). |
+
+**Requirements met:** LLM gateway ✅ (OpenRouter via Insforge); memory component ✅ (per-importer `classifications`); runs in a browser on phone + laptop ✅ (verified live).
+
+### Agent workflow diagram
+
+```mermaid
+flowchart TD
+    U[Broker submits product description] --> G{Authenticated session?}
+    G -->|No| R401[401 — no billable call runs]
+    G -->|Yes| TEN[Resolve importer/tenant<br/>from verified JWT claims]
+    TEN --> PRE[Fetch per-importer precedent<br/>similar prior classifications]
+    PRE --> SYS[Build system prompt:<br/>broker persona + GRI policy + precedent]
+    SYS --> RET[Tool: retrieve — hybrid+rerank<br/>over HTS/GRI/rulings corpus]
+    RET --> DEC{Currency / novelty gap?}
+    DEC -->|No| SYN
+    DEC -->|Yes| WEB[Tool: web_search — Tavily]
+    WEB --> SYN[Synthesize: exactly 3 ranked candidates<br/>GRI reasoning + citations + confidence]
+    SYN --> VAL[Server-side verification:<br/>drop fabricated citations,<br/>reject codes with no corpus backing]
+    VAL --> SRC[Derive sources_used from real tool results]
+    SRC --> PERSIST[Persist recommended decision<br/>as future precedent]
+    PERSIST --> OUT[Return top-3 + recommendation + why-not<br/>to the broker for human approval]
+
+    classDef guard fill:#e0f0ff,stroke:#06c,color:#000;
+    class VAL,SRC,G guard
+```
+
+**How it works (narrative):** an authenticated broker's product description enters behind the U11 gate — no model, search, or rerank call fires for an unauthenticated request. The server resolves the importer from the JWT (never the client), pulls that importer's similar prior classifications as *precedent*, and builds a system prompt encoding the broker persona and the GRI-first, corpus-first tool policy. The agent **always retrieves from the grounded corpus first** (via the hybrid+rerank retriever), reasons through the GRI in order, and calls **Tavily web search only** when currency or novelty demands it (e.g., a recent Section 301 change the static corpus can't cover). It then synthesizes exactly three ranked candidates with reasoning, citations, and confidence.
+
+Crucially, the synthesis is **buffered and verified server-side before it reaches the broker** (blue nodes): every citation is checked against the chunks actually retrieved — fabricated chunk ids and codes are dropped, and any candidate left with no corpus-backed citation is refused rather than returned. `sources_used` is derived from the real tool results, not the model's self-report. The recommended decision is persisted as future precedent. The broker reviews the top-3, the recommendation, and the "why not the other two" — and makes the final call (**human approval is the last step by design**).
+
+---
+
+## Task 3 — Dealing with the Data
+
+### Chunking strategy, and why
+
+**Hierarchy-preserving, one chunk per authority unit** (KTD3):
+
+- **HTS lines:** one chunk per leaf tariff line, with the **full ancestor path materialized into the chunk text** (Section → Chapter → heading → subheading → line), and `chapter` / `heading` / `subheading` / `hts_code` stored as metadata (~23,393 chunks).
+- **GRI:** one chunk per interpretive rule, tagged by rule number (14 chunks).
+- **CBP rulings:** one chunk per ruling, with `ruling_number` / `hts_code` / `date` as metadata (~300 chunks).
+
+**Why:** the HTS is a *hierarchy* where the discriminating meaning of a leaf line lives in its ancestry — "of cotton" or "knit" is often several levels up, not in the leaf text. A naive fixed-size splitter would sever a line from the context that disambiguates it and destroy the citation boundary. Chunking on the natural unit (one line, one rule, one ruling) with the ancestor path inlined keeps each chunk **self-contained and self-citing**, which is exactly what a defensible, chunk-id-cited answer needs. This was identified as the single highest lever on accuracy, and its quality was validated by the retrieval recall@k check (Task 5) *before* the rest of the stack was built on top of it.
+
+### Data source and external API, and how they interact
+
+- **Private corpus (RAG):** the USITC HTS schedule (~23k leaf lines) + the six GRI + ~300 CBP CROSS rulings, uploaded and embedded into pgvector. This is the **authoritative source for codes** — the agent may only cite codes it retrieves from here. Rulings that describe the same product as any eval test-split row are **excluded at ingestion** (the leakage guard, KTD8 / AE4) so the eval can't read back its own answer key.
+- **External API (Agent):** **Tavily** live web search, for *currency and novelty* — recent trade actions (e.g., 2026 Section 301 changes) or genuinely new products the static corpus doesn't cover.
+
+**How they interact at request time:** the corpus is consulted first and always; the agent decides *per query* whether currency or novelty requires the web. When it does, web results are treated as **untrusted context** — delimited from instructions, and permitted to inform *currency* but **never to introduce an HTS code** (a code must come from the grounded corpus). The two are fused in the reasoning, but the citation contract keeps them distinct: corpus citations carry a `chunk_id`, web citations carry a `url` with `source: "web"`. Verified live in production: the cotton-t-shirt query answers `corpus=true, web=false`; the 2026-Section-301-solar query answers `corpus=true, web=true` with real tariff-source URLs.
+
+---
+
+## Task 4 — End-to-End Agentic RAG Prototype
+
+**Built and deployed.** The full stack — corpus ingestion, the agentic classification loop, per-importer memory, the browser UI, auth/tenant isolation, and the eval harness — is implemented in TypeScript on Next.js + Insforge and **deployed to a public endpoint**: **https://bp6d8gmu.insforge.site**.
+
+Production verification (authenticated as the demo broker):
+
+- `GET /api/health` → `200` + `"ClearClass gateway OK"` (model `openai/gpt-4o-mini`).
+- **AE1 (corpus-grounded):** "a woman's knit cotton t-shirt" → top candidate **`6109.10.00.40`** (the gold code, confidence 0.95), corpus-backed citation, `web=false`.
+- **AE2 (live search):** "solar panels subject to the 2026 Section 301 tariff increase" → top **`8541.43.00.10`**, `web=true` with 5 real Section-301 source URLs.
+- **Auth enforced:** an unauthenticated `/api/chat` request is refused before any billable call.
+
+The app is responsive and runs in a browser on both phone and laptop.
+
+---
+
+## Task 5 — Evals
+
+### Test dataset
+
+The **flexifyai CROSS-derived dataset** (real CBP rulings, Apache-2.0), assembled as a **200-row held-out test split** of *product description → gold HTS code* ([`data/eval-test-split.jsonl`](data/eval-test-split.jsonl)). Ground truth is real customs decisions, and the seed rulings that describe the same product as any test row are excluded from the retrievable corpus (leakage guard, asserted by the harness before scoring).
+
+### Evaluation harness
+
+`npm run eval` ([`eval/`](eval/)) runs three suites, each against **both** retrieval modes on identical inputs, and emits [`eval/report.md`](eval/report.md):
+
+1. **Retrieval `recall@k`** — did the gold code's chunk reach the LLM? Computed with no agent and no synthesis, so it isolates retrieval. *This is the primary Task-6 before/after signal.*
+2. **Deterministic end-to-end accuracy** — the full agent loop, scored exact-match: `top-1 exact` and `top-3 recall` at 10-, 6-, and 4-digit precision.
+3. **RAG quality (autoevals / RAGAS port)** — Faithfulness, Context precision/recall, AnswerRelevancy, LLM-judged on a ~40-row subset.
+
+The harness fails **closed**: the leakage guard aborts on any leak or an empty/truncated corpus read; a suite aborts rather than report a biased aggregate if too many rows error.
+
+### Conclusions (baseline `dense` arm)
+
+- **The harness is trustworthy:** the `dense` baseline reproduces the earlier U5 recall figures *exactly* (6-digit recall@20 = 50.0%, 10-digit = 38.0%), independent confirmation the pipeline measures what it claims.
+- **Retrieval is the right first lever:** even the dense baseline surfaces the gold 6-digit heading for **half** the products in the top-20 — the chunking is sound — but only ~20% at top-1/10-digit, so the precise ordering (and the agent's final pick) is where quality is lost.
+- **Absolute accuracy is modest and honest:** top-1 ≈ 20% at 10 digits / ~34% at 6 digits, below the fine-tuned-70B **ATLAS** reference (~40% / 57.5%) — expected for a COTS `gpt-4o-mini` + RAG stack, and above a naive baseline, which is the challenge's bar. Defensibility (cited reasoning), not raw top-1 accuracy, is the product wedge.
+
+---
+
+## Task 6 — Improving the Prototype
+
+### 6.1 Advanced retriever, and why
+
+**Hybrid retrieval + cross-encoder reranking** ([`lib/retrieval/`](lib/retrieval/)): dense pgvector cosine **fused with lexical full-text ranking** (Postgres `tsvector`/`ts_rank`) via **Reciprocal Rank Fusion** over a top-20–30 candidate pool, then **Cohere Rerank** narrows to the final top-k. *Why:* HTS distinctions are lexical-and-subtle — an exact material or form word ("of cotton", "cast", "knit") decides the heading — so a lexical arm catches keyword matches pure dense retrieval misses, and the cross-encoder reorders the right line to the top. A config flag (`RETRIEVAL_MODE`) selects `dense` vs `hybrid+rerank` so the eval runs both on identical inputs.
+
+### 6.2 Performance vs. the original — measured (n=200, 0 rerank fallbacks, production Cohere key)
+
+**Retrieval recall@k (the primary signal — isolates retrieval):**
+
+| metric | dense (baseline) | hybrid+rerank | Δ |
+|---|---|---|---|
+| recall@5 (≥6-digit) | 34.5% | 39.5% | **+5.0** |
+| recall@10 (≥6-digit) | 42.5% | 48.5% | **+6.0** |
+| recall@20 (≥6-digit) | 50.0% | 52.0% | +2.0 |
+| recall@5 (≥10-digit) | 20.5% | 26.0% | **+5.5** |
+| recall@10 (≥10-digit) | 29.5% | 37.0% | **+7.5** |
+| recall@20 (≥10-digit) | 38.0% | 41.0% | +3.0 |
+
+The lift is **largest at small k (+5 to +7.5) and smallest at k=20 (+2–3)** — the reranker's signature: it reorders the right chunk *to the top*, exactly where the agent's `k=8` retrieval operates. A uniformly-positive, k-ordered pattern across all six cells is a real gain, not noise.
+
+**End-to-end accuracy — does the retrieval gain survive the LLM?**
+
+| metric | dense | hybrid+rerank | Δ |
+|---|---|---|---|
+| top-1 exact (≥10-digit) | 19.6% | 20.0% | +0.4 |
+| top-1 exact (≥6-digit) | 34.2% | 37.0% | +2.8 |
+| **top-3 recall (≥10-digit)** | 25.1% | 30.5% | **+5.4** |
+| **top-3 recall (≥6-digit)** | 41.7% | 48.5% | **+6.8** |
+| **top-3 recall (≥4-digit)** | 53.8% | 60.0% | **+6.2** |
+
+**Key finding:** the retrieval lift **propagates into `top-3` accuracy** (+5.4–6.8, mirroring recall@k) but **washes out at `top-1`** (+0.4–2.8). The reranker gets the right code into the agent's candidate *set* more often; the agent's decision about which candidate to rank **#1** is the remaining bottleneck. This matches the design hypothesis that the LLM synthesis step can mask a retrieval gain in the single final code — and it's why the Task-6 claim leads with recall@k. For a product whose value is the **top-3 defensible candidate set**, top-3 is exactly where the improvement lands.
+
+**RAG quality (autoevals, LLM-judged, n≈38):**
+
+| metric | dense | hybrid+rerank | Δ |
+|---|---|---|---|
+| Faithfulness | 21.5% | 30.3% | **+8.8** |
+| ContextPrecision | 69.2% | 78.9% | **+9.7** |
+| ContextRecall | 7.2% | 9.7% | +2.6 |
+| AnswerRelevancy | — | — | _uninformative; see report note_ |
+
+Better retrieval yields **more precise context (+9.7) and more grounded answers (+8.8)** — the improvement seen from a third, independent angle. (AnswerRelevancy is reported but is not a reliable signal in this run; see the note in [`eval/report.md`](eval/report.md).)
+
+**Decision:** the evidence flips the production default to `RETRIEVAL_MODE=hybrid+rerank` (live).
+
+### 6.3 A second improvement, with eval evidence
+
+Beyond the retriever, a change to the **retrieval input** materially improves what reaches the model: the harness **normalizes the query framing** before embedding ([`eval/dataset.ts` `cleanQuery`](eval/dataset.ts)). The eval dataset (and real chat) phrases products as *"What is the HTS US Code for …?"*; embedding that interrogative wrapper pushes the query vector toward "question" text and away from the terse tariff-line language the corpus is written in. Stripping the wrapper to the bare product phrase measures — and feeds the agent — retrieval as it should be exercised. This is applied identically to both arms, so it is baked into all numbers above rather than reported as its own A/B; it is a deliberate, documented input-quality fix motivated directly by the retrieval-quality lens the harness provides.
+
+The harness also **surfaced the next targeted change with hard evidence**: the `top-1` vs `top-3` gap above localizes the remaining loss to the **agent's final ranking/selection**, not retrieval — see Task 7. _(Note for the reviewer: a clean isolated A/B for a second lever — e.g., a confidence-calibrated re-rank of the agent's own three candidates — is the one deliverable I would most strengthen with another eval run; the retriever is the primary quantified improvement here.)_
+
+---
+
+## Task 7 — Next Steps (keep / change for Demo Day)
+
+**Keep — these earned their place:**
+
+- **The defensibility contract** — server-side citation validation (drop fabricated citations, refuse codes with no corpus backing) and `sources_used` derived from real tool results. It's the product wedge and it works in production.
+- **Hierarchy-preserving chunking** — validated as the top accuracy lever; the dense baseline's soundness rests on it.
+- **`hybrid+rerank` retrieval** — measured, multi-angle improvement; now the default.
+- **The eval harness itself** — three suites, fail-closed guards, reproducible with one command. It's what turned "seems better" into a table, and it caught real silent-failure modes (a rate-limited reranker degrading to fused order; an empty-corpus leakage check certifying nothing).
+- **Server-derived tenancy + RLS** — verified isolation; the right foundation for a multi-broker product.
+
+**Change / improve — the eval tells us where:**
+
+1. **Attack the `top-1` ranking bottleneck** (highest lever). Retrieval now reliably gets the right code into the candidate set (+5–7pt top-3), but the agent's final pick doesn't capture it (+0.4 top-1 at 10-digit). Target this directly: a confidence-calibrated re-rank of the agent's *own* three candidates, GRI-structured chain-of-thought before the final choice, or a small verification pass. This is where accuracy is currently left on the table.
+2. **Add Langfuse tracing.** Monitoring today is gateway + platform logs + health checks; per-request agent traces (tool calls, retrieved chunks, token spend) would make regressions and cost visible at a glance.
+3. **Broaden the corpus** — the ~300-ruling seed is a fraction of CROSS; more precedent should lift both retrieval and groundedness (and the harness will prove or disprove it).
+4. **Operationalize the free-tier keep-alive** — a scheduled ping + verified wake latency before the judging window, so the live demo never cold-starts a paused project.
+
+---
+
+## Reproducing the evaluation
+
+```bash
+npm run eval                                   # sampled sanity pass (both modes)
+npm run eval -- --recall-only                  # the primary Task-6 recall@k signal (cheap)
+npm run eval -- --e2e-limit=200 --rag-limit=40 # the full run behind the tables above
+```
+
+Requires the Insforge admin config + LLM gateway key; `hybrid+rerank` additionally uses a **production** `COHERE_API_KEY` (a free trial key is rate-limited and silently degrades to fused-hybrid order — the harness now reports such degradation).
