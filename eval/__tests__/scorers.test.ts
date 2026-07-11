@@ -166,6 +166,12 @@ describe("renderReport", () => {
     );
   });
 
+  it("records the Task-6.3 re-selection arm when set, and omits it otherwise", () => {
+    expect(renderReport(baseReport())).not.toMatch(/Agent re-selection/);
+    expect(renderReport(baseReport({ reselect: true }))).toMatch(/Agent re-selection.*`ON`/);
+    expect(renderReport(baseReport({ reselect: false }))).toMatch(/Agent re-selection.*`off`/);
+  });
+
   it("shows a signed positive delta where the advanced arm beats the baseline", () => {
     const md = renderReport(baseReport());
     // dense r@5 ≥6-digit = 50.0%, advanced = 65.0% → +15.0 pts.

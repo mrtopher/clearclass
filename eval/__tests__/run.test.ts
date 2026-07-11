@@ -31,6 +31,13 @@ describe("parseArgs", () => {
     expect(args.modes).toEqual(["dense"]);
   });
 
+  it("defaults --reselect off; bare flag turns it on; explicit values are honored", () => {
+    expect(parseArgs([]).reselect).toBe(false);
+    expect(parseArgs(["--reselect"]).reselect).toBe(true);
+    expect(parseArgs(["--reselect=on"]).reselect).toBe(true);
+    expect(parseArgs(["--reselect=off"]).reselect).toBe(false);
+  });
+
   it("accepts the hybrid aliases and dedupes modes", () => {
     expect(parseArgs(["--modes=advanced,hybrid"]).modes).toEqual(["hybrid+rerank"]);
     expect(parseArgs(["--modes=baseline,dense"]).modes).toEqual(["dense"]);

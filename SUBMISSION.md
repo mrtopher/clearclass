@@ -268,11 +268,33 @@ Better retrieval yields **more precise context (+9.7) and more grounded answers 
 
 **Decision:** the evidence flips the production default to `RETRIEVAL_MODE=hybrid+rerank` (live).
 
-### 6.3 A second improvement, with eval evidence
+### 6.3 A second improvement, on the agent side — measured
 
-Beyond the retriever, a change to the **retrieval input** materially improves what reaches the model: the harness **normalizes the query framing** before embedding ([`eval/dataset.ts` `cleanQuery`](eval/dataset.ts)). The eval dataset (and real chat) phrases products as *"What is the HTS US Code for …?"*; embedding that interrogative wrapper pushes the query vector toward "question" text and away from the terse tariff-line language the corpus is written in. Stripping the wrapper to the bare product phrase measures — and feeds the agent — retrieval as it should be exercised. This is applied identically to both arms, so it is baked into all numbers above rather than reported as its own A/B; it is a deliberate, documented input-quality fix motivated directly by the retrieval-quality lens the harness provides.
+The retriever A/B (6.2) localized the remaining loss precisely: `hybrid+rerank` lifts `top-3` by +5.4–6.8 pts but `top-1` barely moves. Retrieval reliably gets the right code into the agent's three candidates; the agent's final **#1 pick** is the bottleneck. So this second improvement targets a **different piece — the agent/synthesis side** — with the retriever held fixed at `hybrid+rerank` for both arms, isolating the agent change.
 
-The harness also **surfaced the next targeted change with hard evidence**: the `top-1` vs `top-3` gap above localizes the remaining loss to the **agent's final ranking/selection**, not retrieval — see Task 7. _(Note for the reviewer: a clean isolated A/B for a second lever — e.g., a confidence-calibrated re-rank of the agent's own three candidates — is the one deliverable I would most strengthen with another eval run; the retriever is the primary quantified improvement here.)_
+**The lever (toggle: `AGENT_RESELECT` env / `--reselect` eval flag, OFF by default).** After the agent emits its three ranked candidates, re-rank them by an *independent* retrieval signal — the position of each candidate's supporting corpus chunk in the reranked result ([`lib/agent.ts` `reselectByRetrievalSupport`](lib/agent.ts)). Hypothesis: the Cohere cross-encoder already surfaces the right line near the top, so promoting the candidate whose evidence the reranker ranked highest should convert `top-3` hits into `top-1` hits. It is a **pure permutation** of the three candidates, so `top-3` recall is invariant by construction and only `top-1` can move — a perfectly isolated A/B. (The *rank*, not the `similarity` value, is the signal: the reranker reorders chunks but leaves each chunk's `similarity` = its dense cosine, so position is what faithfully encodes the cross-encoder's judgment.)
+
+**Result (n=200 attempted, `RETRIEVAL_MODE=hybrid+rerank` fixed, 0 rerank fallbacks):**
+
+| metric | OFF — model's own ranking | ON — retrieval re-selection | Δ |
+|---|---|---|---|
+| top-1 exact (≥10-digit) | 19.7% | 13.6% | **−6.1 pts** |
+| top-1 exact (≥6-digit) | 35.4% | 26.6% | **−8.8 pts** |
+| top-1 exact (≥4-digit) | 45.5% | 37.7% | **−7.8 pts** |
+| top-3 recall (≥10-digit) | 30.3% | 28.1% | −2.2 pts |
+| top-3 recall (≥6-digit) | 46.5% | 45.2% | −1.3 pts |
+| top-3 recall (≥4-digit) | 55.1% | 54.3% | −0.8 pts |
+
+_(OFF scored 198/200, ON 199/200; the 1–2 dropped rows are gateway transport errors, scored per the harness's fail-open row policy. The retriever is identical across arms; both ran with the reranker healthy — 0 fused-hybrid fallbacks.)_
+
+**Conclusion — a clean negative result, and it is informative.** The re-selection **regresses** `top-1` by 6–9 pts across all three digit levels, while `top-3` stays essentially flat (−0.8 to −2.2 pts). That flat `top-3` is the tell: because the lever is a permutation, an equal `top-3` confirms the two independent runs drew comparable candidate *sets*, so the `top-1` drop is the **reordering itself**, not generation drift. The signal is the uniform negative sign across all six `top-1` cells, not any single cell against the ±7% CI. The finding: **the LLM's own final ranking already beats the raw reranker position** — the agent folds the retrieval signal *and* GRI reasoning into its pick, and substituting bare chunk order throws that reasoning away. The `top-1` bottleneck is real, but it is **not** closed by trusting retrieval order over the model's judgment. The productive next lever adds *more* reasoning at the decision point (a GRI-structured self-verification / confidence-calibration pass over the three candidates), not one that overrides the model with a single retrieval feature — see Task 7. The change ships behind an **OFF-by-default toggle**, so production ranking is unchanged; the harness A/Bs it with:
+
+```bash
+npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag            # OFF (model ranking)
+npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag --reselect # ON  (re-selection)
+```
+
+**A companion input-quality fix** (baked into every retrieval/accuracy number in 6.2, applied identically to both arms so it is not its own A/B): the harness normalizes the eval's *"What is the HTS code for …?"* framing to the bare product phrase before embedding ([`eval/dataset.ts` `cleanQuery`](eval/dataset.ts)). The interrogative wrapper pushes the query vector toward "question" text and away from the terse tariff-line language the corpus is written in — a phrasing that never occurs in production — so stripping it measures and feeds the agent retrieval as it is actually exercised.
 
 ---
 
@@ -288,7 +310,7 @@ The harness also **surfaced the next targeted change with hard evidence**: the `
 
 **Change / improve — the eval tells us where:**
 
-1. **Attack the `top-1` ranking bottleneck** (highest lever). Retrieval now reliably gets the right code into the candidate set (+5–7pt top-3), but the agent's final pick doesn't capture it (+0.4 top-1 at 10-digit). Target this directly: a confidence-calibrated re-rank of the agent's *own* three candidates, GRI-structured chain-of-thought before the final choice, or a small verification pass. This is where accuracy is currently left on the table.
+1. **Attack the `top-1` ranking bottleneck** (highest lever) — but *with more reasoning, not less*. Retrieval reliably gets the right code into the candidate set (+5–7pt top-3), yet the agent's final pick doesn't capture it (+0.4 top-1 at 10-digit). Task 6.3 tested the tempting shortcut — re-ranking the agent's own three candidates by their supporting chunk's retrieval position — and **measured it regressing `top-1` by 6–9 pts** (§6.3): the model's ranking already beats raw retrieval order because it reasons over the candidates, so overriding it discards signal. The evidence redirects the next attempt to a lever that *augments* the decision: a GRI-structured self-verification pass over the three candidates (walk GRI 1→6 to confirm/deny the #1 before committing), or a confidence-calibration step that blends the model's reasoning with retrieval agreement rather than replacing it. The harness is already wired to A/B it (the `--reselect` seam generalizes to any candidate-re-selection policy).
 2. **Add Langfuse tracing.** Monitoring today is gateway + platform logs + health checks; per-request agent traces (tool calls, retrieved chunks, token spend) would make regressions and cost visible at a glance.
 3. **Broaden the corpus** — the ~300-ruling seed is a fraction of CROSS; more precedent should lift both retrieval and groundedness (and the harness will prove or disprove it).
 4. **Operationalize the free-tier keep-alive** — a scheduled ping + verified wake latency before the judging window, so the live demo never cold-starts a paused project.
@@ -300,7 +322,10 @@ The harness also **surfaced the next targeted change with hard evidence**: the `
 ```bash
 npm run eval                                   # sampled sanity pass (both modes)
 npm run eval -- --recall-only                  # the primary Task-6 recall@k signal (cheap)
-npm run eval -- --e2e-limit=200 --rag-limit=40 # the full run behind the tables above
+npm run eval -- --e2e-limit=200 --rag-limit=40 # the full run behind the 6.2 tables
+# Task 6.3 agent-side A/B (retrieval held fixed; run once each):
+npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag            # re-selection OFF
+npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag --reselect # re-selection ON
 ```
 
 Requires the Insforge admin config + LLM gateway key; `hybrid+rerank` additionally uses a **production** `COHERE_API_KEY` (a free trial key is rate-limited and silently degrades to fused-hybrid order — the harness now reports such degradation).

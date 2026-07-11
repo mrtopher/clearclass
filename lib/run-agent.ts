@@ -28,6 +28,7 @@ import {
   latestUserText,
   MAX_STEPS,
   normalizeMessages,
+  resolveReselect,
   RETRIEVE_TOOL,
   runClassification,
   WEB_SEARCH_TOOL,
@@ -42,6 +43,9 @@ export interface RunAgentOverrides {
   /** Inject fake memory I/O (embed / search / insert) in tests; defaults to the
    *  real gateway + the RLS-scoped authenticated client (`lib/memory.ts`). */
   memory?: Partial<MemoryDeps>;
+  /** Force the Task-6.3 retrieval-support re-selection on/off (tests); defaults to
+   *  the `AGENT_RESELECT` env arm via {@link resolveReselect}. */
+  reselect?: boolean;
 }
 
 /**
@@ -69,6 +73,7 @@ export function createRunAgent(overrides: RunAgentOverrides = {}): RunAgent {
       tools,
       generate: overrides.generate ?? defaultGenerate,
       maxSteps: overrides.maxSteps ?? MAX_STEPS,
+      reselect: overrides.reselect ?? resolveReselect(),
     };
     // Per-request memory: created here so its query-embedding memoization (shared
     // between the precedent read and the persist) is scoped to this one request.
