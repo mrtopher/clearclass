@@ -17,6 +17,7 @@
     "migrate": "npx @insforge/cli db migrations up --all",
     "embed:load": "tsx --env-file-if-exists=.env.local scripts/embed-load.ts",
     "eval:recall": "tsx --env-file-if-exists=.env.local eval/retrieval-recall.ts",
+    "eval": "tsx --env-file-if-exists=.env.local eval/run.ts",
     "verify:rls": "tsx --env-file-if-exists=.env.local scripts/verify-rls.ts",
     "seed:demo": "tsx --env-file-if-exists=.env.local scripts/seed-demo-broker.ts",
     "deploy": "npx @insforge/cli deployments deploy ."
@@ -35,6 +36,7 @@
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "autoevals": "^0.0.132",
     "tailwindcss": "^4.0.0",
     "tsx": "^4.23.0",
     "typescript": "^5.6.0",
