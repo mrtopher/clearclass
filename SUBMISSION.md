@@ -296,6 +296,56 @@ npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag --reselect # ON
 
 **A companion input-quality fix** (baked into every retrieval/accuracy number in 6.2, applied identically to both arms so it is not its own A/B): the harness normalizes the eval's *"What is the HTS code for …?"* framing to the bare product phrase before embedding ([`eval/dataset.ts` `cleanQuery`](eval/dataset.ts)). The interrogative wrapper pushes the query vector toward "question" text and away from the terse tariff-line language the corpus is written in — a phrasing that never occurs in production — so stripping it measures and feeds the agent retrieval as it is actually exercised.
 
+### 6.4 A third improvement — query-side rewriting (attacking the ranking bottleneck), measured
+
+§6.2–6.3 pinned the diagnosis: the dominant classification error is retrieval **ranking**, not coverage — every HTS code already exists in the corpus as a tariff leaf-line, so the gold chunk is never *missing*; the retriever just fails to rank a terse tariff line ("Live horses … > Purebred breeding animals > Males") above near-misses for a natural-language product description. Query and corpus are written in two different registers. This third improvement closes that register gap at **retrieval time** — no corpus reload, so no DB-OOM risk; a pure ranking lever, exactly as the diagnosis prescribed.
+
+**The lever (toggle: `QUERY_REWRITE` env / `--rewrite` eval flag, OFF by default).** A HyDE-style rewrite ([`lib/retrieval/rewrite.ts`](lib/retrieval/rewrite.ts)): a cheap LLM turns the product description into the concise "tariff-ese" a classification heading is written in — material/composition, form, principal use — preserving every concrete distinguishing detail (specs, chemical names, origin). Two compose strategies, measured against each other: **`expand`** retrieves on `original + rewrite` (query expansion); **`hyde`** retrieves on the rewrite ALONE (pure HyDE). It wraps *either* retrieval arm (same `DenseRetriever` shape), so it composes with the production `hybrid+rerank` retriever and rides the same recall@k / e2e harness, and it degrades safely — any rewrite failure falls back to the original query (never worse than the un-rewritten baseline), with a harness fallback-counter so a degraded run is flagged rather than silently reported as rewritten.
+
+**Re-baseline first — the §6.2/6.3 numbers are the 300-ruling corpus; the corpus is now 2,000 rulings.** Re-running on the current corpus reproduces §6.2 within noise (dense recall@10 ≥6-digit 42.0%, hybrid+rerank 49.0%; hybrid+rerank e2e top-3 ≥6-digit 48.5%, *matching §6.2 exactly*), reconfirming that the corpus broadening left recall flat — the ranking-not-coverage finding still holds. These current-corpus numbers are the "before" below.
+
+**Recall@k — the primary signal (n=200, both strategies vs. OFF, retrieval mode held fixed):**
+
+_hybrid+rerank arm (production default):_
+| recall@k | OFF | expand | hyde |
+|---|---|---|---|
+| @5 (≥6-digit) | 40.0% | 38.0% | **42.0%** |
+| @10 (≥6-digit) | 49.0% | 43.0% | **52.0%** |
+| @20 (≥6-digit) | 52.0% | 50.0% | **55.0%** |
+| @5 (≥10-digit) | 27.5% | 22.5% | 26.5% |
+| @10 (≥10-digit) | 35.5% | 29.5% | **39.0%** |
+| @20 (≥10-digit) | 40.5% | 36.5% | **43.0%** |
+
+_(dense arm, for contrast: both strategies flat — e.g. recall@10 ≥6-digit 42.0% → 41.0% (expand) / 42.5% (hyde); recall@20 ≥10-digit 36.0% → 37.5% / 36.5%.)_
+
+**Finding — the composition matters as much as the rewrite.** On the **dense** arm both strategies are flat: a bi-encoder already bridges the register gap semantically, so rewriting the query into document-space text is a wash. On the production **hybrid+rerank** arm the two strategies **diverge sharply**: `expand` *regresses* recall −2 to −6 pts, while `hyde` *lifts* it **+2 to +3.5 pts** across five of six cells (recall@10 ≥10-digit 35.5→39.0, recall@20 ≥6-digit 52.0→55.0). Same rewrite text, opposite sign — because `expand` **doubles** the query and dilutes the two components that key on surface terms (the lexical `ts_rank` arm and the Cohere cross-encoder), whereas `hyde` **replaces** the query with tariff-register text those components match on directly. The win is a register *match*, not extra tokens — and it compounds specifically with `hybrid+rerank`, the arm already in production.
+
+**End-to-end accuracy — does the retrieval gain survive the LLM? (hybrid+rerank fixed, OFF vs `hyde`):**
+
+| metric | OFF | hyde | Δ |
+|---|---|---|---|
+| top-1 exact (≥10-digit) | 20.5% | 22.4% | +1.9 |
+| top-1 exact (≥6-digit) | 37.0% | 35.4% | −1.6 |
+| top-1 exact (≥4-digit) | 50.0% | 50.5% | +0.5 |
+| top-3 recall (≥10-digit) | 29.5% | 30.7% | +1.2 |
+| top-3 recall (≥6-digit) | 48.5% | 45.8% | −2.7 |
+| top-3 recall (≥4-digit) | 59.0% | 59.9% | +0.9 |
+
+_(OFF scored 200/200, `hyde` 192/200 — 8 gateway transport errors, within the harness's 10% fail-open tolerance; the delta therefore spans slightly non-identical denominators.)_
+
+**Conclusion — a clean *retrieval* win that is *e2e-neutral* at this n, and the asymmetry is informative.** The recall@k lift on the production arm is real and uniform in sign (+2 to +3.5 across 5/6 cells) — the primary Task-6 signal, cleanly isolated from the LLM. But it does **not** propagate to a statistically meaningful end-to-end gain: every e2e Δ sits well inside the ±7% n=200 CI with mixed sign. Two compounding reasons, both already established here: (a) §6.2/6.3's finding that the **LLM ranking/synthesis step is the binding constraint** downstream of retrieval; and (b) specific to this lever — in the *agentic* e2e path the model **already reformulates its own search query** (the system prompt directs it to search by material/use/form), so the register gap the rewrite exploits is smaller e2e than in the raw-description recall harness where the lever shines. The lever's cleanest value is on a **non-agentic** retrieval path.
+
+**Decision — ship the lever behind the flag, keep `QUERY_REWRITE=off` in production.** The recall improvement is documented and reproducible, but it does not yet justify adding a billable per-query LLM call to the live path when the end-to-end answer is unmoved. This matches the project's evidence bar exactly: §6.2 flipped `hybrid+rerank` ON only on a clean multi-angle lift; §6.3 kept `reselect` OFF on a non-win; here the honest call is OFF-by-default until the top-3 retrieval gain is *converted* into a top-1 gain (the Task-7 fresh-retrieval verifier, item 2). The flag makes that future A/B a one-liner. Reproduce:
+
+```bash
+npm run eval -- --recall-only --modes=dense,hybrid+rerank                          # rewrite OFF (baseline)
+npm run eval -- --recall-only --modes=dense,hybrid+rerank --rewrite=hyde           # rewrite ON  (HyDE)
+npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag                   # e2e OFF
+npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag --rewrite=hyde    # e2e ON
+```
+
+**(A harness fix surfaced by the re-baseline.)** Re-baselining on the 2,000-ruling corpus exposed a latent break: the eval's AE4 leakage guard fetched *all* rulings in a single PostgREST page (server-capped at 1,000 rows), so on the broadened corpus the full `eval` aborted every time — *"corpus has 2000 rulings but the page returned 1000"* — correctly failing **closed** rather than certifying "no leakage" over a truncated read. Fixed to page through with `offset`, reconciling against the `Content-Range` total ([`eval/dataset.ts`](eval/dataset.ts)) while preserving every fail-closed guarantee. Without it the full harness could not run on the current corpus at all.
+
 ---
 
 ## Task 7 — Next Steps (keep / change for Demo Day)
@@ -310,7 +360,7 @@ npm run eval -- --modes=hybrid+rerank --e2e-limit=200 --skip-rag --reselect # ON
 
 **Change / improve — the eval tells us where:**
 
-1. **Fix retrieval *ranking* — the highest lever (and we proved it's ranking, not coverage).** Decomposing the top-1 miss at 10-digit: the correct code reaches the agent's retrieved context only ~37% of the time (recall@10), the 3-candidate shortlist 30.5%, and the #1 slot 20.0%. The largest single loss (~63%) is the gold code never surfacing in the retrieved top-k. Critically, this is a **ranking failure, not a missing-data one**: every HTS code is *already* in the corpus as a tariff leaf-line chunk, so the correct chunk always exists — the dense retriever simply fails to rank a terse tariff line above near-misses for a natural-language product description. We tested the coverage hypothesis directly and it **failed**: broadening the CBP-ruling seed 6.6× (~300 → 2,000, leakage-guarded) left recall **flat, marginally negative (−2 pts at k=20)**. Two reasons: (a) more rulings add competing chunks, not missing codes; and (b) the leakage guard necessarily drops the rulings most similar to the held-out test items, so on the eval the additions act as distractors. The productive lever is therefore better *ranking* — the direction `hybrid+rerank` already validated (+5–7 pts top-3, §6.2) — via query-side rewriting of the product description toward tariff-line phrasing, learned/fusion reranking, or per-type retrieval. (We kept the broadened corpus regardless: its value is **defensibility** — more citable precedent for real broker queries — which the leakage-guarded recall metric structurally cannot credit.)
+1. **Fix retrieval *ranking* — the highest lever (and we proved it's ranking, not coverage).** Decomposing the top-1 miss at 10-digit: the correct code reaches the agent's retrieved context only ~37% of the time (recall@10), the 3-candidate shortlist 30.5%, and the #1 slot 20.0%. The largest single loss (~63%) is the gold code never surfacing in the retrieved top-k. Critically, this is a **ranking failure, not a missing-data one**: every HTS code is *already* in the corpus as a tariff leaf-line chunk, so the correct chunk always exists — the dense retriever simply fails to rank a terse tariff line above near-misses for a natural-language product description. We tested the coverage hypothesis directly and it **failed**: broadening the CBP-ruling seed 6.6× (~300 → 2,000, leakage-guarded) left recall **flat, marginally negative (−2 pts at k=20)**. Two reasons: (a) more rulings add competing chunks, not missing codes; and (b) the leakage guard necessarily drops the rulings most similar to the held-out test items, so on the eval the additions act as distractors. The productive lever is therefore better *ranking* — the direction `hybrid+rerank` already validated (+5–7 pts top-3, §6.2). **We executed the first of these — query-side rewriting (§6.4)** — and it delivered a clean recall@k lift on the production arm (+2 to +3.5 pts, `hyde` strategy), confirming ranking *is* a movable lever; but the gain stayed within noise end-to-end, a third data point that the binding downstream constraint is the LLM ranking step (item 2), not retrieval surface. Remaining ranking directions: learned/fusion reranking and per-type retrieval. (We kept the broadened corpus regardless: its value is **defensibility** — more citable precedent for real broker queries — which the leakage-guarded recall metric structurally cannot credit.)
 2. **Attack the `top-1` ranking bottleneck — a real but *ceiling-capped* lever.** Once the right code is in the shortlist, the agent ranks it #1 only 20.0% of the 30.5% (10-digit), so perfect re-ranking of the existing candidates could add at most ~10 pts — worth doing, but bounded by the top-3 recall that item #1 raises. Task 6.3 already ruled out the tempting shortcut — re-ranking the three candidates by their supporting chunk's retrieval position **regressed `top-1` by 6–9 pts** (§6.3), because the model's own ranking already folds in both retrieval signal *and* GRI reasoning, so overriding it with bare chunk order discards signal. The lesson: a self-verification pass helps only if it introduces information the first pass lacked — e.g. **fresh, per-candidate retrieval** (pull the specific competing-heading ruling or GRI note for each of the three) or an independent verifier model — not the same model re-reasoning over the same inputs. The harness is wired to A/B any such policy (the `--reselect` seam generalizes).
 3. **Add Langfuse tracing.** Monitoring today is gateway + platform logs + health checks; per-request agent traces (tool calls, retrieved chunks, token spend) would make regressions and cost visible at a glance.
 4. **~~Operationalize the free-tier keep-alive~~ — resolved.** The project is now on Insforge's paid **pro** tier, which does not auto-pause on inactivity, so no scheduled ping is needed for the judging window.

@@ -162,9 +162,15 @@ export function findLeakage(
 }
 
 const DOCUMENTS_TABLE = "documents";
-/** PostgREST caps a page; the seed is ~300 rulings, so this pulls them in one page
- *  while still asserting (via Content-Range) that nothing was silently truncated. */
-const RULING_PAGE_LIMIT = 5000;
+/** PostgREST enforces a server-side max rows PER PAGE (1000 on this proxy),
+ *  regardless of a larger `limit`. The corpus broadened to 2000 rulings, so a
+ *  single-page read now silently truncates — `createFetchRulingSubjects` pages
+ *  through with `offset` and reconciles against the Content-Range total instead. */
+const RULING_PAGE_SIZE = 1000;
+/** Hard cap on pages to page through, so a proxy that never advances the offset
+ *  (or a runaway total) can't spin forever. 100 pages × 1000 = 100k rulings, far
+ *  above any plausible seed — hitting it is a defect, not a legitimate corpus. */
+const RULING_MAX_PAGES = 100;
 
 /** Fetch the product subject of every retrievable ruling chunk from the corpus. */
 export type FetchRulingSubjects = () => Promise<string[]>;
@@ -179,46 +185,57 @@ export type FetchRulingSubjects = () => Promise<string[]>;
  */
 export function createFetchRulingSubjects(cfg: AdminConfig): FetchRulingSubjects {
   return async () => {
-    const url =
-      `${cfg.baseUrl}/api/database/records/${DOCUMENTS_TABLE}` +
-      `?type=eq.ruling&select=metadata,content&limit=${RULING_PAGE_LIMIT}`;
-    const res = await adminFetch(url, {
-      method: "GET",
-      headers: { ...authHeaders(cfg), Prefer: "count=exact" },
-    });
-    if (!res.ok) {
-      throw new Error(
-        `[eval:leakage] fetching ruling subjects failed: HTTP ${res.status}: ` +
-          `${(await res.text()).slice(0, 300)}`,
-      );
-    }
-    const rows = (await res.json()) as Array<{
-      metadata?: { subject_raw?: unknown };
-      content?: unknown;
-    }>;
-    if (!Array.isArray(rows)) {
-      throw new Error("[eval:leakage] expected an array of ruling rows");
-    }
-    // Fail CLOSED on truncation. `count=exact` should return a "start-end/total"
-    // Content-Range; a finite total larger than the page is an explicit truncation.
-    // But a MISSING/unbounded total ("*", or header stripped) with a page sitting
-    // at the row cap could also be truncated — and treating "I can't see the count"
-    // as success is the silent pass to avoid (the whole point of AE4). So the guard
-    // must fire on both, not just the finite-and-larger case.
-    const total = Number.parseInt(res.headers.get("content-range")?.split("/")[1] ?? "", 10);
-    if (Number.isFinite(total)) {
-      if (total > rows.length) {
+    type RulingRow = { metadata?: { subject_raw?: unknown }; content?: unknown };
+    const rows: RulingRow[] = [];
+    // Page through with `offset`, reconciling against the Content-Range total so
+    // the assertion covers the WHOLE corpus, not just the first (server-capped)
+    // page. `count=exact` makes every page carry a "start-end/total" range.
+    let total = Number.POSITIVE_INFINITY;
+    for (let page = 0; rows.length < total; page++) {
+      if (page >= RULING_MAX_PAGES) {
         throw new Error(
-          `[eval:leakage] corpus has ${total} rulings but the page returned ${rows.length}; ` +
-            "raise RULING_PAGE_LIMIT — refusing to certify AE4 over a truncated read.",
+          `[eval:leakage] exceeded ${RULING_MAX_PAGES} pages fetching rulings (offset ${rows.length}, ` +
+            `total ${total}) — refusing to spin; the proxy is not advancing or the corpus is implausibly large.`,
         );
       }
-    } else if (rows.length >= RULING_PAGE_LIMIT) {
-      throw new Error(
-        `[eval:leakage] ruling page hit the ${RULING_PAGE_LIMIT}-row cap but the proxy returned ` +
-          "no verifiable count (Content-Range absent/unbounded) — refusing to certify AE4 over a " +
-          "possibly-truncated read.",
-      );
+      const url =
+        `${cfg.baseUrl}/api/database/records/${DOCUMENTS_TABLE}` +
+        `?type=eq.ruling&select=metadata,content&limit=${RULING_PAGE_SIZE}&offset=${rows.length}`;
+      const res = await adminFetch(url, {
+        method: "GET",
+        headers: { ...authHeaders(cfg), Prefer: "count=exact" },
+      });
+      if (!res.ok) {
+        throw new Error(
+          `[eval:leakage] fetching ruling subjects failed: HTTP ${res.status}: ` +
+            `${(await res.text()).slice(0, 300)}`,
+        );
+      }
+      const pageRows = (await res.json()) as RulingRow[];
+      if (!Array.isArray(pageRows)) {
+        throw new Error("[eval:leakage] expected an array of ruling rows");
+      }
+      // Fail CLOSED when the count is unverifiable. `count=exact` should return a
+      // finite "start-end/total"; a MISSING/unbounded total ("*", or header
+      // stripped) means we cannot know when the read is complete — and treating
+      // "I can't see the count" as success is the silent pass AE4 exists to avoid.
+      const pageTotal = Number.parseInt(res.headers.get("content-range")?.split("/")[1] ?? "", 10);
+      if (!Number.isFinite(pageTotal)) {
+        throw new Error(
+          "[eval:leakage] ruling page returned no verifiable count (Content-Range absent/unbounded) — " +
+            "refusing to certify AE4 over a read whose completeness can't be established.",
+        );
+      }
+      total = pageTotal;
+      rows.push(...pageRows);
+      // No forward progress before reaching the total means the proxy is stuck or
+      // the total is inconsistent — fail closed rather than loop or under-read.
+      if (pageRows.length === 0 && rows.length < total) {
+        throw new Error(
+          `[eval:leakage] ruling paging stalled at ${rows.length}/${total} (empty page) — ` +
+            "refusing to certify AE4 over an incomplete read.",
+        );
+      }
     }
     return rows.map((r) => {
       const subject = r.metadata?.subject_raw;

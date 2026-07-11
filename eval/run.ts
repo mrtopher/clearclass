@@ -53,7 +53,9 @@ import { resolveAdminConfig } from "@/lib/insforge-admin";
 import { DEFAULT_MODEL, embedTexts } from "@/lib/llm";
 import {
   createConfiguredRetriever,
+  resolveQueryRewrite,
   RETRIEVAL_MODES,
+  type QueryRewriteMode,
   type RetrievalMode,
 } from "@/lib/retrieval";
 import { DEFAULT_K } from "@/lib/retrieval/dense";
@@ -176,17 +178,23 @@ async function runPool(
 async function scoreRetrieval(
   rows: readonly TestRow[],
   mode: RetrievalMode,
+  rewrite: QueryRewriteMode,
   maxK: number,
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
-): Promise<LoopOutcome<RowResult> & { rerankFallbacks: number }> {
+): Promise<LoopOutcome<RowResult> & { rerankFallbacks: number; rewriteFallbacks: number }> {
   const scored: RowResult[] = [];
   let errors = 0;
   let done = 0;
   let rerankFallbacks = 0;
+  let rewriteFallbacks = 0;
   const retriever = createConfiguredRetriever(mode, {
+    rewrite,
     onRerankFallback: () => {
       rerankFallbacks++;
+    },
+    onRewriteFallback: () => {
+      rewriteFallbacks++;
     },
   });
   await runPool(rows.length, concurrency, async (i) => {
@@ -202,7 +210,7 @@ async function scoreRetrieval(
     }
     onProgress?.(++done, rows.length);
   });
-  return { scored, errors, rerankFallbacks };
+  return { scored, errors, rerankFallbacks, rewriteFallbacks };
 }
 
 // ── Suite 2: end-to-end classification accuracy ────────────────────────────────
@@ -212,10 +220,14 @@ async function scoreRetrieval(
  *  No memory layer — the eval must not persist precedent into the live table.
  *  `reselect` toggles the Task-6.3 agent-side lever so the harness can A/B it with
  *  RETRIEVAL_MODE held fixed (isolating the agent change from the retriever). */
-function classificationDepsFor(mode: RetrievalMode, reselect: boolean): ClassificationDeps {
+function classificationDepsFor(
+  mode: RetrievalMode,
+  reselect: boolean,
+  rewrite: QueryRewriteMode,
+): ClassificationDeps {
   return {
     tools: {
-      [RETRIEVE_TOOL]: createRetrieveTool(createConfiguredRetriever(mode)),
+      [RETRIEVE_TOOL]: createRetrieveTool(createConfiguredRetriever(mode, { rewrite })),
       [WEB_SEARCH_TOOL]: createTavilyTool(),
     },
     generate: defaultGenerate,
@@ -230,10 +242,11 @@ async function scoreEndToEnd(
   rows: readonly TestRow[],
   mode: RetrievalMode,
   reselect: boolean,
+  rewrite: QueryRewriteMode,
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
 ): Promise<LoopOutcome<ReturnType<typeof toOutcome>>> {
-  const deps = classificationDepsFor(mode, reselect);
+  const deps = classificationDepsFor(mode, reselect, rewrite);
   const scored: ReturnType<typeof toOutcome>[] = [];
   let errors = 0;
   let done = 0;
@@ -376,14 +389,15 @@ async function scoreRagRow(
   row: TestRow,
   mode: RetrievalMode,
   reselect: boolean,
+  rewrite: QueryRewriteMode,
   cfg: JudgeConfig,
 ): Promise<RagScore[]> {
   const query = cleanQuery(row.description);
   const auth = { model: cfg.model, openAiApiKey: cfg.openAiApiKey, openAiBaseUrl: cfg.openAiBaseUrl };
-  const retriever = createConfiguredRetriever(mode);
+  const retriever = createConfiguredRetriever(mode, { rewrite });
   const chunks = await retriever(query, { k: RAG_CONTEXT_K });
   const context = chunks.map((c) => c.content);
-  const result = await runClassification({ messages: query }, classificationDepsFor(mode, reselect));
+  const result = await runClassification({ messages: query }, classificationDepsFor(mode, reselect, rewrite));
   const output = answerText(result);
   const expected = row.reasoning;
 
@@ -413,6 +427,7 @@ async function scoreRag(
   rows: readonly TestRow[],
   mode: RetrievalMode,
   reselect: boolean,
+  rewrite: QueryRewriteMode,
   cfg: JudgeConfig,
   concurrency: number,
   onProgress?: (done: number, total: number) => void,
@@ -422,7 +437,7 @@ async function scoreRag(
   let done = 0;
   await runPool(rows.length, concurrency, async (i) => {
     try {
-      perRow.push(await scoreRagRow(rows[i], mode, reselect, cfg));
+      perRow.push(await scoreRagRow(rows[i], mode, reselect, rewrite, cfg));
     } catch (err) {
       errors++;
       console.warn(`[eval] RAG[${mode}] row ${i + 1} failed: ${(err as Error).message} — skipping.`);
@@ -454,6 +469,10 @@ interface EvalArgs {
    *  support (`--reselect` / `--reselect=off`). Held identical across both retrieval
    *  modes so a run isolates the agent change from the retriever. */
   reselect: boolean;
+  /** Task-7 query-rewrite lever: rewrite the description into tariff-line phrasing
+   *  before retrieval (`--rewrite[=off|expand|hyde]`). Applied identically to both
+   *  retrieval modes; A/B'd by comparing an `off` run against an `expand`/`hyde` run. */
+  rewrite: QueryRewriteMode;
   recallOnly: boolean;
   skipE2e: boolean;
   skipRag: boolean;
@@ -488,6 +507,7 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
     ks: DEFAULT_KS,
     modes: [...RETRIEVAL_MODES],
     reselect: false,
+    rewrite: "off",
     recallOnly: false,
     skipE2e: false,
     skipRag: false,
@@ -525,6 +545,12 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
         // value (even "off") is honoured verbatim here.
         args.reselect = value == null ? true : resolveReselect(value);
         break;
+      case "rewrite":
+        // Bare `--rewrite` turns it on (→ `expand`, the lower-variance strategy);
+        // `--rewrite=off|expand|hyde` is explicit. resolveQueryRewrite reads env only
+        // when undefined, so a defined value (even "off") is honoured verbatim here.
+        args.rewrite = resolveQueryRewrite(value ?? "on");
+        break;
       case "recall-only":
         args.recallOnly = true;
         break;
@@ -543,7 +569,7 @@ export function parseArgs(argv: readonly string[]): EvalArgs {
       default:
         throw new Error(
           `Unrecognized argument: ${JSON.stringify(arg)}. Supported: --split --limit ` +
-            "--e2e-limit --rag-limit --k --modes --reselect --recall-only --skip-e2e --skip-rag --concurrency --out",
+            "--e2e-limit --rag-limit --k --modes --reselect --rewrite --recall-only --skip-e2e --skip-rag --concurrency --out",
         );
     }
   }
@@ -573,7 +599,7 @@ async function main(): Promise<void> {
   const rows = await loadTestRows(args.split, args.limit);
   console.log(
     `[eval] Loaded ${rows.length} test rows. Modes: ${args.modes.join(", ")}. ` +
-      `Agent re-selection: ${args.reselect ? "ON" : "off"}. ` +
+      `Query rewrite: ${args.rewrite}. Agent re-selection: ${args.reselect ? "ON" : "off"}. ` +
       `Suites: recall${args.recallOnly ? " only" : ", e2e, rag"}.`,
   );
 
@@ -611,7 +637,7 @@ async function main(): Promise<void> {
 
     // Suite 1: recall@k (all rows).
     console.log(`[eval] recall@k over ${rows.length} rows (k=${args.ks.join(",")})...`);
-    const r = await scoreRetrieval(rows, mode, maxK, args.concurrency, progress("recall"));
+    const r = await scoreRetrieval(rows, mode, args.rewrite, maxK, args.concurrency, progress("recall"));
     assertErrorRate(`recall[${mode}]`, r.errors, rows.length);
     recall.push({
       mode,
@@ -619,6 +645,9 @@ async function main(): Promise<void> {
       scored: r.scored.length,
       errors: r.errors,
       rerankFallbacks: r.rerankFallbacks,
+      // Only meaningful when the lever ran; leave undefined for `off` so the report
+      // doesn't render a "0 fallbacks" note for a lever that was never engaged.
+      rewriteFallbacks: args.rewrite === "off" ? undefined : r.rewriteFallbacks,
     });
 
     if (args.recallOnly) continue;
@@ -626,7 +655,7 @@ async function main(): Promise<void> {
     // Suite 2: end-to-end accuracy (sampled).
     if (!args.skipE2e) {
       console.log(`[eval] end-to-end accuracy over ${e2eRows.length} rows (full agent loop)...`);
-      const e = await scoreEndToEnd(e2eRows, mode, args.reselect, args.concurrency, progress("e2e"));
+      const e = await scoreEndToEnd(e2eRows, mode, args.reselect, args.rewrite, args.concurrency, progress("e2e"));
       assertErrorRate(`e2e[${mode}]`, e.errors, e2eRows.length);
       accuracy.push({
         mode,
@@ -639,7 +668,7 @@ async function main(): Promise<void> {
     // Suite 3: RAG metrics (sampled, LLM-judged).
     if (!args.skipRag && judgeCfg) {
       console.log(`[eval] RAG metrics over ${ragRows.length} rows (LLM-judged)...`);
-      const g = await scoreRag(ragRows, mode, args.reselect, judgeCfg, args.concurrency, progress("rag"));
+      const g = await scoreRag(ragRows, mode, args.reselect, args.rewrite, judgeCfg, args.concurrency, progress("rag"));
       rag.push({ mode, scores: g.scores, scored: g.scored });
     }
   }
@@ -666,6 +695,7 @@ async function main(): Promise<void> {
     recallDigits: DEFAULT_RECALL_DIGITS,
     accuracyDigits: accuracy.length ? [...ACCURACY_DIGITS] : [],
     reselect: args.reselect,
+    rewrite: args.rewrite,
     leakage,
     recall,
     accuracy,
