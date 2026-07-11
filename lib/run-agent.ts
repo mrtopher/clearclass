@@ -15,9 +15,10 @@
  * fails to resolve). The route (`app/api/chat`, via `lib/chat-gate`) imports
  * `createRunAgent` from here; nothing else does.
  */
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import type { ToolSet } from "ai";
 
+import { flushTraces } from "@/instrumentation";
 import { createMemory, type MemoryDeps } from "@/lib/memory";
 import { createRetrieveTool } from "@/lib/tools/retrieve";
 import { createTavilyTool } from "@/lib/tools/tavily";
@@ -65,13 +66,35 @@ export interface RunAgentOverrides {
  */
 export function createRunAgent(overrides: RunAgentOverrides = {}): RunAgent {
   return async ({ messages, tenant }) => {
+    // Task 7 #3: drain any Langfuse spans this request emitted AFTER the response
+    // is sent, so tracing adds no latency to the broker's answer and a short-lived
+    // server instance still exports before it can be frozen. No-op when unconfigured.
+    // `after` requires a live request scope, which the real route always provides;
+    // guard it so the dependency-injected unit tests (which call this loop directly,
+    // with no request context) — and any future offline caller — still run.
+    try {
+      after(flushTraces);
+    } catch {
+      // Not inside a request scope; nothing was traced to flush here.
+    }
+
     const tools: ToolSet = overrides.tools ?? {
       [RETRIEVE_TOOL]: createRetrieveTool(),
       [WEB_SEARCH_TOOL]: createTavilyTool(),
     };
     const deps: ClassificationDeps = {
       tools,
-      generate: overrides.generate ?? defaultGenerate,
+      // Wrap the default model call to stamp this request's Langfuse trace with the
+      // SERVER-derived tenant (never client input) — the broker as trace `userId`,
+      // the importer scope as an attribute. An injected `generate` (tests) is used
+      // as-is. Passing metadata is inert when Langfuse is unconfigured.
+      generate:
+        overrides.generate ??
+        ((args) =>
+          defaultGenerate(args, {
+            userId: tenant.principal.userId,
+            importerId: tenant.importerId,
+          })),
       maxSteps: overrides.maxSteps ?? MAX_STEPS,
       reselect: overrides.reselect ?? resolveReselect(),
     };
