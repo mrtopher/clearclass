@@ -1,6 +1,6 @@
 # ClearClass — Evaluation Report (U10)
 
-Generated 2026-07-11T23:59:34.366Z over the 200-row flexifyai test split. Each suite is run in both retrieval modes — `dense` (the U5 baseline) and `hybrid+rerank` (the U9 advanced arm) — against identical inputs, so the delta columns isolate the Task-6 retrieval change.
+Generated 2026-07-12T01:23:05.233Z over the 200-row flexifyai test split. Each suite is run in both retrieval modes — `dense` (the U5 baseline) and `hybrid+rerank` (the U9 advanced arm) — against identical inputs, so the delta columns isolate the Task-6 retrieval change.
 
 **Agent re-selection (Task 6.3):** `off` for the end-to-end + RAG suites — the agent-side lever that re-ranks the model's own three candidates by their supporting chunk's retrieval position. For a fixed model output it is a pure permutation (top-3 set unchanged), so across an OFF vs ON pair `top-1 exact` carries the effect while `top-3 recall` moves only within model-sampling noise; compare this run's top-1 against a run with the opposite setting.
 
@@ -25,29 +25,29 @@ Fraction of test rows whose gold HTS code was surfaced in the top-k retrieved ch
 
 ## 2. End-to-end classification accuracy
 
-Deterministic exact-match scoring of the full agent loop (retrieve → reason → rank) — rows scored per mode — dense: 197, hybrid+rerank: 199. `top-1 exact` is the best-ranked candidate; `top-3 recall` is any of the three ranked candidates. A row the agent declines (no defensible corpus-backed code) is scored as a MISS, not excluded.
+Deterministic exact-match scoring of the full agent loop (retrieve → reason → rank) — rows scored per mode — dense: 198, hybrid+rerank: 199. `top-1 exact` is the best-ranked candidate; `top-3 recall` is any of the three ranked candidates. A row the agent declines (no defensible corpus-backed code) is scored as a MISS, not excluded.
 
 | metric | dense (baseline) | hybrid+rerank (advanced) | Δ |
 | --- | --- | --- | --- |
-| top-1 exact (≥10-digit) | 18.3% | 20.6% | +2.3 pts |
-| top-1 exact (≥6-digit) | 33.0% | 35.7% | +2.7 pts |
-| top-1 exact (≥4-digit) | 44.2% | 45.2% | +1.1 pts |
-| top-3 recall (≥10-digit) | 25.4% | 29.6% | +4.3 pts |
-| top-3 recall (≥6-digit) | 42.1% | 44.7% | +2.6 pts |
-| top-3 recall (≥4-digit) | 54.3% | 52.3% | -2.1 pts |
+| top-1 exact (≥10-digit) | 17.7% | 17.6% | -0.1 pts |
+| top-1 exact (≥6-digit) | 32.3% | 33.7% | +1.3 pts |
+| top-1 exact (≥4-digit) | 46.0% | 45.7% | -0.2 pts |
+| top-3 recall (≥10-digit) | 26.3% | 26.6% | +0.4 pts |
+| top-3 recall (≥6-digit) | 45.5% | 47.7% | +2.3 pts |
+| top-3 recall (≥4-digit) | 57.6% | 58.3% | +0.7 pts |
 
 > **Confidence caveat:** at n=200, a binomial 95% CI is roughly ±7%. A small end-to-end delta may be within noise even when recall@k clearly improves — which is why the Task-6 claim leads with recall@k above, not this table.
 
 ## 3. RAG quality metrics (autoevals, LLM-judged)
 
-Braintrust `autoevals` RAGAS-ported scorers on rows scored per mode — dense: 37, hybrid+rerank: 36 (LLM-judged, so slower and noisier than the deterministic suites above — kept small and separate by design; each metric averages only its non-null judgments).
+Braintrust `autoevals` RAGAS-ported scorers on rows scored per mode — dense: 40, hybrid+rerank: 38 (LLM-judged, so slower and noisier than the deterministic suites above — kept small and separate by design; each metric averages only its non-null judgments).
 
 > **AnswerRelevancy note:** we keep autoevals' question generation but recompute the score as the mean **raw** cosine between each generated question and the query. Stock `autoevals` runs that cosine through `EmbeddingSimilarity`'s hardcoded 0.7 floor (`(cos − 0.7) / 0.3`, clamped), which collapses genuinely-relevant question↔description pairs (~0.48 cosine) to 0 on every row — RAGAS itself uses the unfloored cosine. See `eval/run.ts#answerRelevancy`.
 
 | metric | dense (baseline) | hybrid+rerank (advanced) | Δ |
 | --- | --- | --- | --- |
-| Faithfulness | 27.1% | 26.5% | -0.6 pts |
-| AnswerRelevancy | 51.7% | 51.6% | -0.1 pts |
-| ContextPrecision | 70.3% | 77.8% | +7.5 pts |
-| ContextRecall | 5.4% | 6.8% | +1.5 pts |
+| Faithfulness | 22.1% | 29.8% | +7.7 pts |
+| AnswerRelevancy | 51.0% | 51.4% | +0.4 pts |
+| ContextPrecision | 75.0% | 71.1% | -3.9 pts |
+| ContextRecall | 6.4% | 9.1% | +2.7 pts |
 
