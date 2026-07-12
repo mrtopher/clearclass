@@ -1,3 +1,4 @@
+import { NoObjectGeneratedError, NoOutputSpecifiedError, type ToolSet } from "ai";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -15,6 +16,7 @@ import {
   validateCandidateCitations,
   RETRIEVE_TOOL,
   WEB_SEARCH_TOOL,
+  type GenerateArgs,
   type GenerateFn,
   type RankedClassification,
   type RetrievedChunkMeta,
@@ -409,6 +411,87 @@ describe("runClassification", () => {
     expect(args.system).toContain("chunk_id");
     expect(args.messages).toEqual([{ role: "user", content: "silk scarf" }]);
     expect(args.maxSteps).toBeGreaterThan(0);
+  });
+});
+
+/** Build a `NoObjectGeneratedError` for tests — the constructor's response/usage/
+ *  finishReason are irrelevant to `isInstance` (a symbol marker), so stub them. */
+function noObjectError(message: string): NoObjectGeneratedError {
+  return new NoObjectGeneratedError({ message } as ConstructorParameters<
+    typeof NoObjectGeneratedError
+  >[0]);
+}
+
+describe("runClassification repair retry", () => {
+  // Tools carry both names so the retry's web-drop is observable.
+  const tools = {
+    [RETRIEVE_TOOL]: { description: "retrieve" },
+    [WEB_SEARCH_TOOL]: { description: "web" },
+  } as unknown as ToolSet;
+  const validOutput = classification([
+    candidate([corpusCitation(10)]),
+    candidate([corpusCitation(10)]),
+    candidate([corpusCitation(10)]),
+  ]);
+  const validSteps = [retrieveStep([10])];
+
+  it("retries once on NoObjectGeneratedError, dropping web search and appending a repair nudge", async () => {
+    const calls: GenerateArgs[] = [];
+    const generate = vi.fn(async (args: GenerateArgs) => {
+      calls.push(args);
+      if (calls.length === 1) {
+        throw noObjectError("No object generated: response did not match schema.");
+      }
+      return { output: validOutput, steps: validSteps };
+    });
+
+    const result = await runClassification({ messages: "solar cells" }, { tools, generate });
+
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(result.candidates).toHaveLength(3);
+    // First attempt keeps both tools; the retry runs corpus-only.
+    expect(Object.keys(calls[0].tools)).toContain(WEB_SEARCH_TOOL);
+    expect(Object.keys(calls[1].tools)).toEqual([RETRIEVE_TOOL]);
+    // The repair nudge is appended as the latest user turn.
+    const last = calls[1].messages.at(-1);
+    expect(last?.role).toBe("user");
+    expect(String(last?.content)).toContain("FINAL classification");
+  });
+
+  it("recovers from NoOutputSpecifiedError the same way", async () => {
+    let n = 0;
+    const generate = vi.fn(async () => {
+      n += 1;
+      if (n === 1) throw new NoOutputSpecifiedError();
+      return { output: validOutput, steps: validSteps };
+    });
+
+    const result = await runClassification({ messages: "x" }, { tools, generate });
+
+    expect(result.candidates).toHaveLength(3);
+    expect(generate).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a transport/model error unrelated to output shape", async () => {
+    const generate = vi.fn(async () => {
+      throw new Error("gateway 500");
+    });
+
+    await expect(
+      runClassification({ messages: "x" }, { tools, generate }),
+    ).rejects.toThrow("gateway 500");
+    expect(generate).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates a SECOND consecutive output failure (bounded to one retry)", async () => {
+    const generate = vi.fn(async () => {
+      throw noObjectError("still malformed");
+    });
+
+    await expect(
+      runClassification({ messages: "x" }, { tools, generate }),
+    ).rejects.toBeInstanceOf(NoObjectGeneratedError);
+    expect(generate).toHaveBeenCalledTimes(2);
   });
 });
 
