@@ -266,6 +266,8 @@ The lift is **largest at small k (+5 to +7.5) and smallest at k=20 (+2–3)** �
 
 Better retrieval yields **more precise context (+9.7) and more grounded answers (+8.8)** — the improvement seen from a third, independent angle. (AnswerRelevancy is reported but is not a reliable signal in this run; see the note in [`eval/report.md`](eval/report.md).)
 
+> **Current-corpus note (2,000 rulings).** This RAG table is the 300-ruling snapshot. On the current 2,000-ruling corpus (the committed [`eval/report.md`](eval/report.md)) **ContextPrecision reproduces the lift (+7.5)** but the LLM-judged **Faithfulness delta washes out to noise** (−0.6) — expected for this small (n≈36), LLM-judged suite, and consistent with §6.3/§6.4's finding that the binding constraint downstream of retrieval is the **LLM ranking/synthesis step**, not retrieval quality. The primary Task-6 signal — recall@k — reproduces cleanly on the current corpus (uniformly +4 to +7 pts; dense recall@10 ≥6-digit 42.0% → hybrid+rerank 49.0%, matching §6.4), which is why the Task-6 claim leads with recall@k, not this LLM-judged corroborating angle.
+
 **Decision:** the evidence flips the production default to `RETRIEVAL_MODE=hybrid+rerank` (live).
 
 ### 6.3 A second improvement, on the agent side — measured
