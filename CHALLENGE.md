@@ -1,5 +1,10 @@
 # The Certification Challenge v1.0
 
+[Submission From](https://docs.google.com/forms/d/e/1FAIpQLSfVl-bXwO_NlkleaLtSQ1yp2tLM8EM3w5AukRLbP637Dg8_8Q/viewform?usp=publish-editor)  
+[Grading Rubric for reference](https://docs.google.com/spreadsheets/d/1_sV7MuHj674BikQ4Fe1QYiGVUTaBybL3ND5IN2ILq3Q/edit?usp=sharing)
+
+Due: 7pm ET 7/16
+
 # Overview
 
 Welcome to the middle of the course!  We’re 5 weeks in, and we’ve covered a lot of ground - you all certainly have enough prototyping skill to be dangerous!
@@ -14,7 +19,7 @@ How can you build 🏗️, ship 🚢, and share 🚀 your way towards achieving
 
 It all starts now, with the Certification Challenge, which is the next step towards continuing your journey to Demo Day!
 
-**Your Certification Challenge is due Tuesday, July 14th.**
+**Your Certification Challenge is due Tuesday, July 16th.**
 
 >[!Note]
 💡Remember, *you know enough already to be dangerous*. You already know enough of the concepts and code you need to build, ship, and share production AI applications! 
