@@ -34,6 +34,8 @@
 import {
   convertToModelMessages,
   generateText,
+  NoObjectGeneratedError,
+  NoOutputSpecifiedError,
   Output,
   stepCountIs,
   type ModelMessage,
@@ -284,6 +286,8 @@ export function validateCandidateCitations(
  */
 export function buildSystemPrompt(opts: { precedent?: string } = {}): string {
   const base = `You are ClearClass, an expert U.S. customs broker assistant. You classify a product description into the top-3 candidate U.S. HTS codes so a broker can DEFEND the choice — not just receive one.
+
+You are ALWAYS a classifier. Every request concerns a product, even when it is phrased as a policy, tariff, Section 301, exclusion, rate, or currency question — classify THAT product and return three candidates. Never answer such a question in place of classifying, and never return an empty or partial result; fold any currency finding into the candidates' reasoning.
 
 Tools:
 - \`${RETRIEVE_TOOL}\`: search the grounded corpus (US HTS tariff lines, the General Rules of Interpretation, and seeded CBP CROSS rulings). This is your authoritative source for codes.
@@ -593,6 +597,67 @@ export function latestUserText(messages: readonly ModelMessage[]): string {
 }
 
 /**
+ * A one-shot repair nudge appended to the messages on a single retry when the
+ * model failed to emit the ranked object. Two failure modes make the AI SDK
+ * throw instead of returning output, both driven by the model abandoning
+ * "classify" for "answer the question": it emitted a non-conforming object
+ * (`NoObjectGeneratedError` — empty/partial candidates on a policy question), or
+ * it burned every step chaining tool calls (e.g. repeated web searches on a
+ * "check the latest" query) and never synthesized (`NoOutputSpecifiedError`).
+ * The nudge re-asserts the always-classify contract as the latest user turn and
+ * caps further web searching so the retry converges on the object.
+ */
+const REPAIR_NUDGE =
+  "Return your FINAL classification now. You are a classifier: classify the product referenced above and output the single JSON object described in your instructions — EXACTLY three ranked candidates (each with a non-empty hts_code, GRI reasoning, at least one corpus citation, and a confidence), a recommendation, and exactly two why_not entries. Even if the request is phrased as a policy, tariff, Section 301, exclusion, or currency question, do NOT answer that question in place of classifying and do NOT return an empty or partial result. The web is no longer available: retrieve the product's codes from the corpus and then emit the object.";
+
+/** The two AI SDK errors that mean "the loop ran but produced no usable object"
+ *  — as opposed to a transport/gateway failure. These are the recoverable cases
+ *  {@link generateWithRepair} retries; anything else propagates unchanged. */
+function isNoUsableOutputError(err: unknown): boolean {
+  return NoObjectGeneratedError.isInstance(err) || NoOutputSpecifiedError.isInstance(err);
+}
+
+/**
+ * Run the model loop, retrying ONCE with {@link REPAIR_NUDGE} if it produced no
+ * usable object. Robustness floor: the classifier must always return the ranked
+ * shape, but the model occasionally drifts into answering a policy/currency
+ * question — emitting empty candidates (`NoObjectGeneratedError`), or looping
+ * `web_search` calls until the step budget is spent so it never synthesizes
+ * (`NoOutputSpecifiedError`).
+ *
+ * The retry re-runs the loop with two changes: the always-classify contract is
+ * re-asserted as the latest turn, and `web_search` is dropped from the toolset.
+ * Removing web is what makes the retry CONVERGE — it can no longer burn steps
+ * chasing "the latest trade actions," and it must ground codes in the corpus
+ * (which is the product invariant anyway: a code must come from the corpus, never
+ * the web). Citation validation and the defensibility floor still apply to the
+ * recovered output. A SECOND failure is genuine and propagates (→ the flagged 502
+ * in production, an eval error), so this never loops unbounded.
+ */
+async function generateWithRepair(
+  deps: ClassificationDeps,
+  args: GenerateArgs,
+): Promise<GenerateResult> {
+  try {
+    return await deps.generate(args);
+  } catch (err) {
+    if (!isNoUsableOutputError(err)) throw err;
+    console.warn(
+      `[agent] model produced no usable classification (${(err as Error).name}); ` +
+        "retrying once (corpus-only) with a repair nudge",
+    );
+    const corpusOnlyTools: ToolSet = Object.fromEntries(
+      Object.entries(args.tools).filter(([name]) => name !== WEB_SEARCH_TOOL),
+    );
+    return deps.generate({
+      ...args,
+      tools: corpusOnlyTools,
+      messages: [...args.messages, { role: "user", content: REPAIR_NUDGE }],
+    });
+  }
+}
+
+/**
  * The pure classification orchestration: run the model+tool loop, then VERIFY
  * its output server-side before returning. Fully testable via an injected
  * `generate`.
@@ -604,7 +669,7 @@ export async function runClassification(
   const system = buildSystemPrompt({ precedent: input.precedent });
   const messages = normalizeMessages(input.messages);
 
-  const { output, steps } = await deps.generate({
+  const { output, steps } = await generateWithRepair(deps, {
     system,
     messages,
     tools: deps.tools,
@@ -691,6 +756,16 @@ export async function defaultGenerate(
     messages: args.messages,
     tools: args.tools,
     stopWhen: stepCountIs(args.maxSteps),
+    // Force the LAST allowed step to synthesize: `stepCountIs` halts the loop
+    // AFTER the step budget is spent but never forces the model to stop calling
+    // tools, so a model that keeps chaining tool calls (e.g. repeated web searches
+    // on a "check the latest" query) runs to the limit on a dangling tool call —
+    // leaving `experimental_output` null and throwing `NoOutputSpecifiedError`.
+    // Banning tools on the final step guarantees it ends on a synthesis step. This
+    // only bites at the step limit; a normal query that stops in 2–3 steps never
+    // reaches it, so the main path is unchanged.
+    prepareStep: ({ stepNumber }) =>
+      stepNumber >= args.maxSteps - 1 ? { toolChoice: "none" } : undefined,
     experimental_output: Output.object({ schema: classificationSchema }),
     abortSignal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
     experimental_telemetry: telemetrySettings({
